@@ -534,7 +534,7 @@ email_brand_image = "assets/kordalo/images/kordalo-logo.jpg"
 default_mail_footer = """
 	<span>
 		Sent via
-		<a class="text-muted" href="https://frappe.io/erpnext?source=via_email_footer" target="_blank">
+		<a class="text-muted" href="https://kordalo.com?source=via_email_footer" target="_blank">
 			Kordalo
 		</a>
 	</span>

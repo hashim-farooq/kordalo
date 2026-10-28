@@ -25,7 +25,17 @@ HERE = Path(__file__).resolve().parent
 BRANDING = HERE / "branding"
 
 # Top-level paths in the Kordalo repo that belong to us, not upstream.
-KEEP = {".git", ".github", "tools", "deploy", "docker", "README.md", "NOTICE.md", ".dockerignore"}
+KEEP = {
+	".git",
+	".github",
+	"tools",
+	"deploy",
+	"docker",
+	"README.md",
+	"NOTICE.md",
+	".dockerignore",
+	".gitattributes",
+}
 
 # Upstream files that only make sense for Frappe's own project/infrastructure.
 DROP = {

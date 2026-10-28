@@ -20,7 +20,7 @@ COPY --chown=frappe:frappe . apps/kordalo
 RUN set -eux; \
     ./env/bin/python apps/kordalo/tools/rebrand/patch_frappe.py apps/frappe; \
     uv pip install --python ./env/bin/python -e apps/kordalo; \
-    echo kordalo >> sites/apps.txt; \
+    printf 'frappe\nkordalo\n' > sites/apps.txt; \
     (cd apps/kordalo && yarn install --frozen-lockfile); \
     bench build --app kordalo; \
     rm -rf apps/kordalo/node_modules apps/kordalo/banking/node_modules apps/kordalo/tools; \

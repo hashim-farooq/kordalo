@@ -1,4 +1,4 @@
-# Kordalo - web based ERP (http://kordalo.com)
+# Kordalo - web based ERP (https://kordalo.com)
 # Copyright (C) 2012 Frappe Technologies Pvt Ltd
 #
 # This program is free software: you can redistribute it and/or modify

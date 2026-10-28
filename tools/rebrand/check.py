@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from rebrand import DOC_URL, NAME, VERBATIM, is_binary  # noqa: E402
+from rebrand import DOC_URL, NAME, VERBATIM, is_binary
 
 ALLOWED_FILES = VERBATIM | {"NOTICE.md"}
 SKIP_DIRS = {".git", "node_modules", "tools"}

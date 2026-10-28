@@ -24,7 +24,8 @@ cleanup() {
 }
 trap 'cleanup $?' EXIT
 
-docker compose up -d --quiet-pull frontend queue-short queue-long scheduler
+# Everything except Caddy (no real domain / certificates in CI).
+docker compose up -d --quiet-pull $(docker compose config --services | grep -vx caddy)
 docker compose exec -T backend wait-for-it -t 180 db:3306
 docker compose exec -T backend bench new-site "$SITE" \
   --mariadb-user-host-login-scope='%' --admin-password ci-admin-password \
