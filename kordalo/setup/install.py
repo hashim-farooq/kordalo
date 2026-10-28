@@ -15,7 +15,7 @@ from kordalo.setup.utils import identity as _
 from .default_success_action import get_default_success_action
 
 default_mail_footer = """<div style="padding: 7px; text-align: right; color: #888"><small>Sent via
-	<a style="color: #888" href="http://frappe.io/erpnext">Kordalo</a></div>"""
+	<a style="color: #888" href="https://kordalo.com">Kordalo</a></div>"""
 
 
 def after_install():
