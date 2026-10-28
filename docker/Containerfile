@@ -1,0 +1,51 @@
+# Kordalo production image. Build from the repo root:
+#   docker build -f docker/Containerfile -t kordalo .
+# Mirrors frappe_docker's "layered" image: a builder stage with the toolchain,
+# then the bench copied onto the slim runtime base.
+ARG FRAPPE_BRANCH=version-16
+
+FROM frappe/build:${FRAPPE_BRANCH} AS builder
+ARG FRAPPE_TAG=v16.53.0
+USER frappe
+RUN bench init \
+      --frappe-branch=${FRAPPE_TAG} \
+      --frappe-path=https://github.com/frappe/frappe \
+      --no-procfile \
+      --no-backups \
+      --skip-redis-config-generation \
+      /home/frappe/frappe-bench
+WORKDIR /home/frappe/frappe-bench
+
+COPY --chown=frappe:frappe . apps/kordalo
+RUN set -eux; \
+    ./env/bin/python apps/kordalo/tools/rebrand/patch_frappe.py apps/frappe; \
+    uv pip install --python ./env/bin/python -e apps/kordalo; \
+    echo kordalo >> sites/apps.txt; \
+    (cd apps/kordalo && yarn install --frozen-lockfile); \
+    bench build --app kordalo; \
+    rm -rf apps/kordalo/node_modules apps/kordalo/banking/node_modules apps/kordalo/tools; \
+    echo "{}" > sites/common_site_config.json; \
+    find apps -mindepth 2 -maxdepth 2 -name .git -exec rm -rf {} +; \
+    chmod -R g=u /home/frappe/frappe-bench
+
+FROM frappe/base:${FRAPPE_BRANCH} AS backend
+LABEL org.opencontainers.image.source="https://github.com/hashim-farooq/kordalo" \
+      org.opencontainers.image.title="Kordalo" \
+      org.opencontainers.image.licenses="GPL-3.0"
+USER frappe
+COPY --from=builder --chown=frappe:0 /home/frappe/frappe-bench /home/frappe/frappe-bench
+WORKDIR /home/frappe/frappe-bench
+RUN chmod g=u /home/frappe/frappe-bench \
+    && cp -r sites/assets assets \
+    && rm -rf sites/assets
+
+VOLUME ["/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/logs"]
+
+USER root
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/start.sh /usr/local/bin/start.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/start.sh
+USER frappe
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["start.sh"]

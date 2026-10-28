@@ -1,0 +1,58 @@
+name: Upstream sync
+
+# Weekly: if the upstream engine published a newer v16 release, regenerate the
+# app from it with tools/rebrand and open a PR. CI then tests the PR like any other.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Find latest upstream releases
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source tools/rebrand/upstream.env
+          latest() { gh api "repos/frappe/$1/tags?per_page=100" --paginate --jq '.[].name' | grep -E '^v16\.[0-9]+\.[0-9]+$' | sort -V | tail -1; }
+          up=$(latest erpnext); fw=$(latest frappe)
+          echo "current=$UPSTREAM_TAG latest=$up frappe=$fw"
+          echo "tag=$up" >> "$GITHUB_OUTPUT"
+          echo "frappe=$fw" >> "$GITHUB_OUTPUT"
+          [ "$up" != "$UPSTREAM_TAG" ] && echo "changed=true" >> "$GITHUB_OUTPUT" || true
+      - name: Regenerate from upstream
+        if: steps.latest.outputs.changed == 'true'
+        run: |
+          git clone --depth 1 --branch "${{ steps.latest.outputs.tag }}" https://github.com/frappe/erpnext /tmp/upstream
+          python tools/rebrand/rebrand.py sync /tmp/upstream .
+          pip install -q ruff==0.2.0
+          ruff check --select I --fix --quiet . || true
+          ruff format --quiet .
+          sed -i "s/^UPSTREAM_TAG=.*/UPSTREAM_TAG=${{ steps.latest.outputs.tag }}/; s/^FRAPPE_TAG=.*/FRAPPE_TAG=${{ steps.latest.outputs.frappe }}/" tools/rebrand/upstream.env
+          sed -i "s/^ARG FRAPPE_TAG=.*/ARG FRAPPE_TAG=${{ steps.latest.outputs.frappe }}/" docker/Containerfile
+          python tools/rebrand/check.py
+      - name: Open pull request
+        if: steps.latest.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          # A personal access token (repo + workflow scopes) lets CI run on the PR automatically.
+          # With the default token, close and reopen the PR to trigger CI.
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          branch: upstream-sync/${{ steps.latest.outputs.tag }}
+          title: "chore: sync with upstream engine ${{ steps.latest.outputs.tag }}"
+          commit-message: "chore: sync with upstream engine ${{ steps.latest.outputs.tag }}"
+          body: |
+            Regenerated with `tools/rebrand/rebrand.py` from upstream ${{ steps.latest.outputs.tag }}
+            (framework ${{ steps.latest.outputs.frappe }}). Merge once CI is green, then tag a release.
+          delete-branch: true

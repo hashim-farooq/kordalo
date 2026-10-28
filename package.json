@@ -1,0 +1,24 @@
+{
+  "name": "kordalo",
+  "description": "Open Source ERP System powered by the Frappe Framework",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hashim-farooq/kordalo.git"
+  },
+  "homepage": "https://kordalo.com",
+  "author": "Frappe Technologies Pvt. Ltd.",
+  "license": "GPL-3.0",
+  "bugs": {
+    "url": "https://github.com/hashim-farooq/kordalo/issues"
+  },
+  "scripts": {
+    "postinstall": "cd banking && yarn install",
+    "dev": "cd banking && yarn dev",
+    "build": "cd banking && yarn build",
+    "test:js": "node --test \"kordalo/tests/js/**/*.test.mjs\""
+  },
+  "devDependencies": {},
+  "dependencies": {
+    "onscan.js": "^1.5.2"
+  }
+}

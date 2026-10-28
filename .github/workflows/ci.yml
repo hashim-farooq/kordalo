@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: pre-commit/action@v3.0.1
+
+  rebrand:
+    name: Rebrand guard
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: No leftover references to the old name
+        run: python tools/rebrand/check.py
+      - name: Python compiles, no merge conflict markers
+        run: |
+          python -m compileall -q kordalo tools
+          if grep -rl --exclude-dir=node_modules --exclude-dir=.git "^<<<<<<< " .; then exit 1; fi
+
+  js-tests:
+    name: JS unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: yarn test:js
+
+  server-tests:
+    name: Server tests (${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      TZ: Asia/Kolkata
+      NODE_ENV: production
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Add test_site to hosts
+        run: echo "127.0.0.1 test_site" | sudo tee -a /etc/hosts
+      - name: Install bench, apps and test site
+        run: bash .github/helper/install.sh
+      - name: Bootstrap test data
+        working-directory: /home/runner/frappe-bench
+        run: bench --site test_site run-tests --lightmode --module kordalo.tests.bootstrap_test_data
+      - name: Run tests
+        working-directory: /home/runner/frappe-bench
+        run: >-
+          bench --site test_site run-parallel-tests --lightmode --app kordalo
+          --total-builds 4 --build-number ${{ matrix.shard }}
+      - name: Bench log
+        if: always()
+        run: tail -n 200 ~/frappe-bench/bench_start.log || true
+
+  docker:
+    name: Docker build & smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Containerfile
+          load: true
+          tags: kordalo:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: bash .github/helper/smoke-test.sh kordalo ci
+
+  publish:
+    name: Publish image
+    needs: [lint, rebrand, js-tests, server-tests, docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Containerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:main
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha

@@ -1,0 +1,81 @@
+name: Release
+
+# Push a tag like v1.0.0 from a commit on main that passed CI:
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  image:
+    name: Build & push image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Tag must be on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::Tag is not on main"; exit 1; }
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Containerfile
+          load: true
+          tags: kordalo:release
+          cache-from: type=gha
+      - name: Smoke test
+        run: bash .github/helper/smoke-test.sh kordalo release
+      - name: Push
+        run: |
+          for t in "${GITHUB_REF_NAME}" latest; do
+            docker tag kordalo:release "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+  deploy:
+    name: Deploy to production
+    needs: image
+    # Turn on by setting the repository variable DEPLOY_ENABLED=true (after the server exists).
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency: production
+    steps:
+      - name: Upgrade server to ${{ github.ref_name }}
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh "kordalo@$HOST" "bash ~/kordalo-deploy/scripts/upgrade.sh '$GITHUB_REF_NAME'"
+      - name: Health check
+        env:
+          URL: ${{ vars.PRODUCTION_URL }}
+        run: |
+          for i in $(seq 1 20); do
+            curl -fsS "$URL/api/method/ping" | grep -q pong && exit 0
+            sleep 15
+          done
+          echo "::error::Production did not come back healthy"; exit 1

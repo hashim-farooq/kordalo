@@ -1,0 +1,139 @@
+# Copyright (c) 2023, Frappe Technologies Pvt. Ltd. and Contributors
+# MIT License. See license.txt
+
+import frappe
+from frappe.utils import today
+
+from kordalo.accounts.doctype.account.test_account import create_account
+from kordalo.accounts.report.financial_ratios.financial_ratios import (
+	execute,
+	get_gl_data,
+	update_balances,
+)
+from kordalo.accounts.report.financial_statements import get_period_list
+from kordalo.tests.utils import KordaloTestSuite
+
+
+class TestFinancialRatios(KordaloTestSuite):
+	def setUp(self):
+		self.company = "_Test Company"
+		self.abbr = "_TC"
+		# The report matches the group accounts by their account_type, which the
+		# standard chart of accounts does not set on group accounts by default.
+		self.set_account_type("Fixed Assets", "Fixed Asset")
+		self.set_account_type("Direct Income", "Direct Income")
+
+	def set_account_type(self, account_name, account_type):
+		frappe.db.set_value("Account", f"{account_name} - {self.abbr}", "account_type", account_type)
+
+	def test_fixed_asset_turnover_uses_net_fixed_assets(self):
+		# Acquire a fixed asset worth 10,000 funded by equity.
+		self.make_journal_entry("Buildings", "Capital Stock", 10000)
+		# Book sales of 20,000 collected in cash. Total assets now = 30,000
+		# (Buildings 10,000 + Cash 20,000), while net fixed assets stay at 10,000.
+		self.make_journal_entry("Cash", "Sales", 20000)
+
+		columns, data = execute(self.get_report_filters())
+		year_key = columns[1]["fieldname"]
+		ratio_row = next((row for row in data if row.get("ratio") == "Fixed Asset Turnover Ratio"), None)
+		self.assertIsNotNone(ratio_row, "Fixed Asset Turnover Ratio row not found in report output")
+
+		# Net Sales / Net Fixed Assets = 20,000 / 10,000 = 2.0
+		# (the old behaviour divided by total assets, giving 20,000 / 30,000 = 0.667)
+		self.assertEqual(ratio_row[year_key], 2.0)
+
+	def test_fixed_asset_turnover_combines_groups_of_same_type(self):
+		self.make_group_with_ledger(
+			"_Test Solar Power System", "Application of Funds (Assets)", "Fixed Asset", "_Test Solar Panels"
+		)
+		self.make_group_with_ledger("_Test Plant Group", "Fixed Assets", "Fixed Asset", "_Test Plant")
+		self.make_journal_entry("Buildings", "Capital Stock", 10000)
+		self.make_journal_entry("_Test Solar Panels", "Capital Stock", 5000)
+		self.make_journal_entry("_Test Plant", "Capital Stock", 3000)
+		self.make_journal_entry("Cash", "Sales", 36000)
+
+		columns, data = execute(self.get_report_filters())
+		ratio_row = next(row for row in data if row.get("ratio") == "Fixed Asset Turnover Ratio")
+
+		self.assertEqual(ratio_row[columns[1]["fieldname"]], 2.0)
+
+	def test_direct_expense_combines_groups_of_same_type(self):
+		self.set_account_type("Direct Expenses", "Direct Expense")
+		self.make_group_with_ledger("_Test Freight Group", "Expenses", "Direct Expense", "_Test Freight")
+		before = self.get_direct_expense()
+		self.make_journal_entry("Cost of Goods Sold", "Creditors", 200, supplier="_Test Supplier")
+		self.make_journal_entry("_Test Freight", "Creditors", 300, supplier="_Test Supplier")
+
+		self.assertEqual(self.get_direct_expense() - before, 500)
+
+	def get_period_list(self, filters):
+		return get_period_list(
+			filters.from_fiscal_year,
+			filters.to_fiscal_year,
+			filters.period_start_date,
+			filters.period_end_date,
+			filters.filter_based_on,
+			filters.periodicity,
+			company=filters.company,
+		)
+
+	def get_direct_expense(self):
+		filters = self.get_report_filters()
+		period_list = self.get_period_list(filters)
+		year = period_list[0].key
+		expense = get_gl_data(filters, period_list, [year])[3]
+		direct_expense = {}
+		update_balances(direct_expense, {}, "Direct Expense", year, expense, "Expense")
+		return direct_expense.get(year, 0)
+
+	def get_report_filters(self):
+		active_fy = frappe.db.get_value(
+			"Fiscal Year",
+			{"disabled": 0, "year_start_date": ("<=", today()), "year_end_date": (">=", today())},
+			["name", "year_start_date", "year_end_date"],
+			as_dict=True,
+		)
+		return frappe._dict(
+			company=self.company,
+			from_fiscal_year=active_fy.name,
+			to_fiscal_year=active_fy.name,
+			period_start_date=active_fy.year_start_date,
+			period_end_date=active_fy.year_end_date,
+			filter_based_on="Fiscal Year",
+			periodicity="Yearly",
+		)
+
+	def make_group_with_ledger(self, group_name, parent_name, account_type, ledger_name):
+		create_account(
+			account_name=group_name,
+			parent_account=f"{parent_name} - {self.abbr}",
+			account_type=account_type,
+			is_group=1,
+			company=self.company,
+		)
+		create_account(
+			account_name=ledger_name,
+			parent_account=f"{group_name} - {self.abbr}",
+			company=self.company,
+		)
+
+	def make_journal_entry(self, debit_account, credit_account, amount, supplier=None):
+		journal_entry = frappe.new_doc("Journal Entry")
+		journal_entry.posting_date = today()
+		journal_entry.company = self.company
+		for account, debit, credit, party in (
+			(debit_account, amount, 0, None),
+			(credit_account, 0, amount, supplier),
+		):
+			journal_entry.append(
+				"accounts",
+				{
+					"account": f"{account} - {self.abbr}",
+					"debit_in_account_currency": debit,
+					"credit_in_account_currency": credit,
+					"party_type": "Supplier" if party else None,
+					"party": party,
+				},
+			)
+		journal_entry.insert()
+		journal_entry.submit()

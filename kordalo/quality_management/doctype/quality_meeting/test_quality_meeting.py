@@ -1,0 +1,14 @@
+# Copyright (c) 2018, Frappe and Contributors
+# See license.txt
+import unittest
+
+import frappe
+
+from kordalo.tests.utils import KordaloTestSuite
+
+
+class TestQualityMeeting(KordaloTestSuite):
+	def test_two_meetings_on_the_same_day(self):
+		first = frappe.get_doc(doctype="Quality Meeting").insert()
+		second = frappe.get_doc(doctype="Quality Meeting").insert()
+		self.assertNotEqual(first.name, second.name)
