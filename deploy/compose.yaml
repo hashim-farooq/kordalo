@@ -20,6 +20,12 @@ x-backend: &backend
   depends_on:
     configurator:
       condition: service_completed_successfully
+    db:
+      condition: service_healthy
+    redis-cache:
+      condition: service_started
+    redis-queue:
+      condition: service_started
   volumes:
     - sites:/home/frappe/frappe-bench/sites
     - logs:/home/frappe/frappe-bench/logs
@@ -75,7 +81,8 @@ services:
       SOCKETIO: websocket:9000
       # Pick the site from the requested domain -> one site per customer domain.
       FRAPPE_SITE_NAME_HEADER: $$host
-      UPSTREAM_REAL_IP_ADDRESS: 172.28.0.0/16
+      # Only Caddy can reach the frontend (it publishes no ports), so trust its X-Forwarded-For.
+      UPSTREAM_REAL_IP_ADDRESS: 0.0.0.0/0
       UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
       UPSTREAM_REAL_IP_RECURSIVE: "off"
       PROXY_READ_TIMEOUT: "120"
@@ -131,12 +138,6 @@ services:
     <<: *logging
     volumes:
       - redis-queue-data:/data
-
-networks:
-  default:
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
 
 volumes:
   db-data:
