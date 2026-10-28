@@ -1,88 +1,102 @@
-# Running Kordalo on Hetzner
+# Deploying Kordalo (CI/CD)
 
-One 4 GB Hetzner server running the Kordalo Docker image, with automatic HTTPS, a hardened firewall,
-nightly encrypted off-site backups, and one-command scripts to restore, upgrade and add customers.
+Production is one Hetzner server running the Kordalo Docker image. **Deployments are done by GitHub
+Actions**: each release (a `v*` tag on `main`) is built, smoke-tested and published, and then, after you
+approve it, deployed to the server. The pipeline uploads this folder, writes the server's `.env` from
+GitHub Secrets, installs Kordalo on the first run or backs up and upgrades on later runs, and then checks
+that the site is healthy.
 
-**Cost:** about €5–8/month (server + Hetzner backups + a few cents of Backblaze storage) + ~$10/year domain.
+```
+PR ──► CI (lint · rebrand guard · JS tests · full server tests · Docker smoke test)
+        │ merge
+main ──► CI ──► image ghcr.io/hashim-farooq/kordalo:main
+        │ git tag v1.2.0
+tag ──► Release: build ► smoke test ► publish :v1.2.0 ► GitHub Release
+                      ► [you approve] ► deploy to server ► health check https://app.kordalo.com
+```
+
+**Cost:** about €5–8/month (Hetzner CX23 + backups, a few cents of Backblaze) + ~$10/year domain.
 **Realistic availability:** ~99.5% excluding announced upgrade windows.
 
-> Use **personal** accounts and email for everything below, not work accounts.
+---
 
-## One-time setup (≈ 45 minutes)
+## One-time setup
 
-### 1. Accounts you create yourself
-| What | Where | Cost |
-|---|---|---|
-| Domain `kordalo.com` | Cloudflare Registrar or Porkbun | ~$10/year |
-| Hetzner Cloud | https://accounts.hetzner.com/signUp (needs ID check + card) | pay-as-you-go |
-| Backblaze B2 (off-site backups) | https://www.backblaze.com/sign-up/cloud-storage | first 10 GB free |
-| UptimeRobot (downtime alerts) | https://uptimerobot.com | free |
-| Healthchecks.io (backup alerts) | https://healthchecks.io | free |
+> Use **personal** accounts and email only, never work accounts.
 
-### 2. Prepare on your PC (PowerShell, in this `deploy` folder)
-```powershell
-.\scripts\setup-local.ps1
-```
-Creates an SSH key and copies the server config to your clipboard.
+### Already prepared
+- SSH keys in `~/.ssh`: `kordalo_hetzner` (your own emergency access) and `kordalo_ci_deploy`
+  (used by GitHub Actions; its public half is `deploy/ci-deploy.pub`).
+- `deploy/cloud-init.generated.yaml`: server setup with both public keys filled in (git-ignored).
+  Re-create it any time with `.\scripts\setup-local.ps1`.
+- `KORDALO-SECRETS.txt` (next to the repo folder): freshly generated passwords, ready to paste into GitHub.
+- The `production` environment requires your approval before every deploy.
 
-### 3. Create the server (Hetzner Cloud Console → Add Server)
-- **Location:** closest to your customers
-- **Image:** Ubuntu 24.04 · **Type:** Shared vCPU → x86 → **CX23** (2 vCPU / 4 GB)
-- **Networking:** IPv4 + IPv6 · **Cloud config:** paste your clipboard · **Backups:** ✅ enable
-- **Name:** `kordalo-prod-1`. Copy its **IPv4 address**; wait ~3 minutes for setup to finish.
+### Your steps (≈ 40 minutes)
+1. **Buy the domain** `kordalo.com` (Cloudflare Registrar or Porkbun).
+2. **Create a Hetzner Cloud account** at https://accounts.hetzner.com/signUp (ID check + card).
+3. **Create the server:** Cloud Console → *Add Server*:
+   Ubuntu 24.04 · Shared vCPU x86 **CX23** · location near your customers · IPv4 + IPv6 ·
+   **Backups on** · name `kordalo-prod-1` · *Cloud config*: paste the whole of
+   `deploy/cloud-init.generated.yaml`. Copy the server's **IPv4** address.
+4. **DNS:** at your registrar add `A  app  → <server IPv4>` (and `AAAA app → <IPv6>`).
+   On Cloudflare, set the record to **DNS only** (grey cloud). Optionally add a wildcard `*` record for customer subdomains.
+5. **Backblaze B2** (https://www.backblaze.com): create a **private** bucket and an Application Key restricted
+   to it. Note the endpoint (e.g. `s3.us-west-004.backblazeb2.com`), keyID and applicationKey.
+6. **GitHub settings:** go to github.com/hashim-farooq/kordalo → *Settings → Secrets and variables → Actions*.
+   - *Secrets* tab → *New repository secret* for each:
 
-### 4. DNS
-Add an **A record** `app` → server IPv4 (and **AAAA** → IPv6). On Cloudflare: **DNS only** (grey cloud).
-Optional: a wildcard `*` record too, so every `<customer>.kordalo.com` works without more DNS changes.
+     | Name | Value |
+     |---|---|
+     | `DEPLOY_SSH_KEY` | entire contents of `C:\Users\hashi\.ssh\kordalo_ci_deploy` (incl. BEGIN/END lines) |
+     | `DB_ROOT_PASSWORD`, `ADMIN_PASSWORD`, `RESTIC_PASSWORD` | from `KORDALO-SECRETS.txt` |
+     | `ACME_EMAIL` | your personal email (certificate expiry notices) |
+     | `RESTIC_REPOSITORY` | `s3:https://<endpoint>/<bucket>` |
+     | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Backblaze keyID / applicationKey |
 
-### 5. Backup bucket (Backblaze B2)
-Create a **private** bucket and an **Application Key** restricted to it. Note the endpoint
-(e.g. `s3.us-west-004.backblazeb2.com`), keyID and applicationKey.
+   - *Variables* tab → *New repository variable*: `PRIMARY_DOMAIN` = `app.kordalo.com` ·
+     `DEPLOY_HOST` = server IPv4 · `DEPLOY_ENABLED` = `true`
+   - Save the three passwords in a password manager, then delete `KORDALO-SECRETS.txt`.
+7. **First deploy:** *Actions → Release → Run workflow*, version `v1.0.0`. Approve it when GitHub asks
+   (*Review deployments → production → Approve*). It takes about 10 minutes and ends with a green health check.
+8. Open `https://app.kordalo.com`, log in as `Administrator` with `ADMIN_PASSWORD`, and complete the setup wizard.
 
-### 6. Fill in `.env`
-```powershell
-Copy-Item .env.example .env
-code .env
-```
-Set `ACME_EMAIL`, `RESTIC_REPOSITORY=s3:https://<endpoint>/<bucket>`, `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, and `KORDALO_VERSION` (latest tag from the GitHub Releases page).
-Leave the password fields empty; they get generated.
+### Optional but recommended (free)
+- **UptimeRobot:** HTTP monitor on `https://app.kordalo.com/api/method/ping`, every 5 min.
+- **Healthchecks.io:** a check with a 1-day period; put its ping URL in the secret `HEALTHCHECK_URL`
+  (applied on the next deploy) to get alerted if a nightly backup doesn't run.
+- **Pin the server's host key:** run `ssh-keyscan -t ed25519 <server-ip>` and save the output as the secret
+  `DEPLOY_KNOWN_HOSTS`. Without it, deploys trust whatever key the server presents.
 
-### 7. Upload and install
-```powershell
-.\scripts\push.ps1 -ServerIp <your-server-ip>
-ssh kordalo
-bash ~/kordalo-deploy/scripts/deploy.sh
-```
-Save the printed passwords in a password manager. `RESTIC_PASSWORD` is the only way to decrypt backups.
-Open `https://app.kordalo.com`, log in as `Administrator`, and complete the setup wizard.
+---
 
-### 8. Monitoring
-- **UptimeRobot:** monitor `https://app.kordalo.com/api/method/ping` every 5 min.
-- **Healthchecks.io:** check with period 1 day / grace 2 h; put its URL in `HEALTHCHECK_URL` in the server's `.env`.
+## Everyday operations
 
-### 9. Prove your backups work
-Run `bash ~/kordalo-deploy/scripts/backup.sh`, then on a throwaway CX23 server do steps 3, 6, 7 but run
-`scripts/restore.sh` instead of `deploy.sh`. Check your data, delete the test server.
-
-## Day-to-day (`ssh kordalo`, then `cd ~/kordalo-deploy`)
-
-| Task | Command |
+| Task | How |
 |---|---|
-| New customer | point DNS first, then `bash scripts/add-site.sh acme.kordalo.com` |
-| Upgrade (or let the Release workflow do it) | `bash scripts/upgrade.sh v1.2.0` |
-| Manual backup | `bash scripts/backup.sh` |
-| Status / logs | `docker compose ps` · `docker compose logs -f --tail 100 backend` |
-| Restart everything | `docker compose restart` |
-| Disaster recovery to a new server | `bash scripts/restore.sh` |
+| Ship a change | PR → green CI → merge → `git tag v1.x.y && git push origin v1.x.y` → approve the deploy |
+| Redeploy / roll back to a release | *Actions → Release → Run workflow* with that version |
+| Upstream engine update | The weekly *Upstream sync* PR → merge when green → tag a release |
+| Change a setting/secret | Update it in GitHub, then redeploy the current version |
+| New customer site | `ssh kordalo` → `cd ~/kordalo-deploy && bash scripts/add-site.sh acme.kordalo.com` |
+| Logs / status | `ssh kordalo` → `cd ~/kordalo-deploy && docker compose ps` / `docker compose logs -f backend` |
+| Disaster recovery | New server (steps 3–4) → `DEPLOY_HOST` = new IP → `ssh kordalo` → `bash ~/kordalo-deploy/scripts/restore.sh` after one deploy run |
 
-## What protects your uptime
-- Every container auto-restarts; the stack comes back after a reboot.
-- 4 GB swap + tuned MariaDB memory; Docker logs capped so the disk can't fill.
-- Automatic security updates, firewall (SSH/HTTP/HTTPS only), key-only SSH, fail2ban.
-- Two backup layers: Hetzner daily snapshots + encrypted nightly restic backups at Backblaze.
-- Every release is smoke-tested in CI before it can reach the server.
+`ssh kordalo` works after you add this to `~/.ssh/config` on your PC:
+```
+Host kordalo
+    HostName <server IPv4>
+    User kordalo
+    IdentityFile ~/.ssh/kordalo_hetzner
+```
+
+## What protects uptime
+- Every release is fully tested and smoke-tested before it can reach the server; deploys need your approval.
+- Each upgrade takes an off-site backup first.
+- All containers auto-restart. Swap and capped logs prevent out-of-memory and full-disk crashes.
+- Automatic OS security updates, firewall (SSH/HTTP/HTTPS only), key-only SSH, fail2ban.
+- Two backup layers: Hetzner daily snapshots plus encrypted nightly restic backups at Backblaze.
 
 ## When to grow
-- RAM regularly > 80% (`free -h`) → resize to CX33/CX43 in the Hetzner console (~2 min downtime).
+- RAM regularly > 80% → resize to CX33/CX43 in the Hetzner console (~2 min downtime).
 - Customers need a contractual SLA above 99.5% → multi-server setup with a managed database.
