@@ -57,7 +57,7 @@ tag ──► Release: build ► smoke test ► publish :v1.2.0 ► GitHub Relea
    - *Variables* tab → *New repository variable*: `PRIMARY_DOMAIN` = `app.kordalo.com` ·
      `DEPLOY_HOST` = server IPv4 · `DEPLOY_ENABLED` = `true`
    - Save the three passwords in a password manager, then delete `KORDALO-SECRETS.txt`.
-7. **First deploy:** *Actions → Release → Run workflow*, version `v1.0.0`. Approve it when GitHub asks
+7. **First deploy:** *Actions → Release → Run workflow*, version = the latest release (`v1.0.2` or newer). Approve it when GitHub asks
    (*Review deployments → production → Approve*). It takes about 10 minutes and ends with a green health check.
 8. Open `https://app.kordalo.com`, log in as `Administrator` with `ADMIN_PASSWORD`, and complete the setup wizard.
 
