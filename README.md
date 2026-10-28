@@ -19,25 +19,23 @@
 | Workflow | Trigger | What it does |
 |---|---|---|
 | **CI** | every PR and push to `main` | Lint (pre-commit: ruff, eslint, prettier, JSON/YAML checks) · rebrand guard · JS unit tests · full server test suite on MariaDB (4 parallel shards) · Docker build + live smoke test (boots the image, creates a site, checks login, branding and setup wizard). On `main`, publishes `ghcr.io/hashim-farooq/kordalo:main`. |
-| **Release** | push a tag `v*` on `main` | Builds, smoke-tests and publishes `ghcr.io/hashim-farooq/kordalo:<tag>` + `:latest`, creates a GitHub Release, then (once enabled) deploys to production after manual approval and verifies health. |
+| **Release** | push a tag `v*` on `main`, or run manually with a version | Builds, smoke-tests and publishes `ghcr.io/hashim-farooq/kordalo:<tag>` + `:latest`, creates a GitHub Release, then **deploys to production** after your approval: uploads `deploy/`, writes the server's `.env` from GitHub Secrets, installs (first run) or backs up and upgrades, and health-checks the live site. |
 | **Upstream sync** | weekly + manual | If a newer upstream v16 release exists, regenerates the app and opens a PR for CI to test. |
 
 `main` is protected: changes land through pull requests with all CI checks green.
 
-### Releasing
+### Shipping a change
 ```bash
+# after the PR is merged and main is green:
 git checkout main && git pull
 git tag v1.1.0 && git push origin v1.1.0
+# then approve the "production" deployment in the Actions tab
 ```
+To redeploy or roll back: *Actions → Release → Run workflow* with the version.
 
-### Enabling automatic deploys (after the server exists)
-1. Create a deploy key: `ssh-keygen -t ed25519 -f kordalo_deploy -N ""`, and append `kordalo_deploy.pub` to
-   `~/.ssh/authorized_keys` on the server.
-2. Repo **Settings → Secrets and variables → Actions**:
-   secrets `DEPLOY_HOST` (server IP), `DEPLOY_SSH_KEY` (contents of `kordalo_deploy`),
-   `DEPLOY_KNOWN_HOSTS` (output of `ssh-keyscan <server-ip>`);
-   variables `PRODUCTION_URL=https://app.kordalo.com` and `DEPLOY_ENABLED=true`.
-3. The `production` environment requires your approval before each deploy.
+### Production setup
+One-time setup (server, DNS, backups, GitHub secrets) and day-to-day operations:
+**[deploy/README.md](deploy/README.md)**.
 
 ## Developing locally
 Use a standard Frappe bench (Python 3.14, Node 24, MariaDB 11.8):

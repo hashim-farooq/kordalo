@@ -1,6 +1,6 @@
 #cloud-config
-# Template. Run scripts\setup-local.ps1 to produce cloud-init.generated.yaml with your SSH key,
-# then paste that into Hetzner's "Cloud config" box when creating the server.
+# Template. Run scripts\setup-local.ps1 to produce cloud-init.generated.yaml with your SSH key and
+# the GitHub Actions deploy key (ci-deploy.pub), then paste that into Hetzner's "Cloud config" box.
 groups:
   - docker
 
@@ -11,6 +11,7 @@ users:
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
       - __SSH_PUBLIC_KEY__
+      - __DEPLOY_PUBLIC_KEY__
 
 package_update: true
 package_upgrade: true

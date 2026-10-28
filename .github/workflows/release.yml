@@ -1,10 +1,17 @@
 name: Release
 
-# Push a tag like v1.0.0 from a commit on main that passed CI:
-#   git tag v1.0.0 && git push origin v1.0.0
+# Push a tag like v1.1.0 from a commit on main that passed CI:
+#   git tag v1.1.0 && git push origin v1.1.0
+# Or run it manually (Actions → Release → Run workflow) to deploy an existing release,
+# e.g. the first deploy after the server is created.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to deploy (e.g. v1.0.0)"
+        required: true
 
 permissions:
   contents: write
@@ -12,10 +19,12 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  VERSION: ${{ inputs.version || github.ref_name }}
 
 jobs:
   image:
     name: Build & push image
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -42,40 +51,90 @@ jobs:
         run: bash .github/helper/smoke-test.sh kordalo release
       - name: Push
         run: |
-          for t in "${GITHUB_REF_NAME}" latest; do
+          for t in "$VERSION" latest; do
             docker tag kordalo:release "$IMAGE:$t"
             docker push "$IMAGE:$t"
           done
       - name: GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: gh release create "$VERSION" --generate-notes --verify-tag
 
   deploy:
     name: Deploy to production
     needs: image
-    # Turn on by setting the repository variable DEPLOY_ENABLED=true (after the server exists).
-    if: vars.DEPLOY_ENABLED == 'true'
+    # Enabled by the repository variable DEPLOY_ENABLED=true (set once the server exists).
+    if: >-
+      always() && vars.DEPLOY_ENABLED == 'true'
+      && (needs.image.result == 'success' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     environment: production
     concurrency: production
+    timeout-minutes: 45
+    env:
+      HOST: ${{ vars.DEPLOY_HOST }}
+      DOMAIN: ${{ vars.PRIMARY_DOMAIN }}
     steps:
-      - name: Upgrade server to ${{ github.ref_name }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.VERSION }}
+
+      - name: Check configuration
+        env:
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=""
+          for v in HOST DOMAIN ACME_EMAIL SSH_KEY; do [ -n "${!v}" ] || missing="$missing $v"; done
+          [ -z "$missing" ] || { echo "::error::Missing repository settings:$missing (see deploy/README.md)"; exit 1; }
+
+      - name: SSH setup
         env:
           SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
-          HOST: ${{ secrets.DEPLOY_HOST }}
         run: |
           install -m 700 -d ~/.ssh
-          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
-          echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
-          ssh "kordalo@$HOST" "bash ~/kordalo-deploy/scripts/upgrade.sh '$GITHUB_REF_NAME'"
-      - name: Health check
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$KNOWN_HOSTS" ]; then
+            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::DEPLOY_KNOWN_HOSTS not set; trusting the server's current host key."
+            ssh-keyscan -t ed25519 "$HOST" > ~/.ssh/known_hosts
+          fi
+          printf 'Host prod\n  HostName %s\n  User kordalo\n  ConnectTimeout 20\n' "$HOST" > ~/.ssh/config
+          # A fresh server may still be running its first-boot setup.
+          for i in $(seq 1 30); do ssh prod true && break; sleep 10; done
+          ssh prod 'cloud-init status --wait >/dev/null || true; docker --version'
+
+      - name: Upload deploy kit and settings
         env:
-          URL: ${{ vars.PRODUCTION_URL }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          RESTIC_REPOSITORY: ${{ secrets.RESTIC_REPOSITORY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
         run: |
-          for i in $(seq 1 20); do
-            curl -fsS "$URL/api/method/ping" | grep -q pong && exit 0
+          ssh prod 'mkdir -p ~/kordalo-deploy/scripts'
+          scp -q deploy/compose.yaml deploy/Caddyfile deploy/.env.example prod:kordalo-deploy/
+          scp -q deploy/scripts/*.sh prod:kordalo-deploy/scripts/
+          {
+            echo "PRIMARY_DOMAIN=$DOMAIN"
+            for v in ACME_EMAIL DB_ROOT_PASSWORD ADMIN_PASSWORD RESTIC_PASSWORD RESTIC_REPOSITORY \
+                     AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY HEALTHCHECK_URL; do
+              echo "$v=${!v}"
+            done
+          } | ssh prod 'umask 077; cat > ~/kordalo-deploy/.env.ci'
+
+      - name: Install or upgrade to ${{ env.VERSION }}
+        run: ssh prod "bash ~/kordalo-deploy/scripts/ci-deploy.sh '$VERSION'"
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 40); do
+            curl -fsS "https://$DOMAIN/api/method/ping" | grep -q pong && { echo "https://$DOMAIN is up"; exit 0; }
             sleep 15
           done
-          echo "::error::Production did not come back healthy"; exit 1
+          echo "::error::https://$DOMAIN did not come up healthy"; exit 1
