@@ -332,6 +332,16 @@ sounds = [
 
 has_upload_permission = {"Employee": "kordalo.setup.doctype.employee.employee.has_upload_permission"}
 
+permission_query_conditions = {
+	"Call Log": "kordalo.telephony.doctype.call_log.call_log.get_permission_query_conditions",
+	"Voice Call Settings": "kordalo.telephony.doctype.voice_call_settings.voice_call_settings.get_permission_query_conditions",
+}
+
+has_permission = {
+	"Call Log": "kordalo.telephony.doctype.call_log.call_log.has_permission",
+	"Voice Call Settings": "kordalo.telephony.doctype.voice_call_settings.voice_call_settings.has_permission",
+}
+
 has_website_permission = {
 	"Sales Order": "kordalo.controllers.website_list_for_contact.has_website_permission",
 	"Quotation": "kordalo.controllers.website_list_for_contact.has_website_permission",
@@ -397,6 +407,7 @@ doc_events = {
 		"on_update": [
 			"kordalo.support.doctype.service_level_agreement.service_level_agreement.on_communication_update",
 			"kordalo.support.doctype.issue.issue.set_first_response_time",
+			"kordalo.support.doctype.issue.issue.reopen_issue_without_sla",
 		],
 		"after_insert": [
 			"kordalo.crm.utils.link_communications_with_prospect",
@@ -427,6 +438,9 @@ doc_events = {
 	"Payment Entry": {
 		"on_trash": "kordalo.regional.check_deletion_permission",
 	},
+	"Company": {
+		"after_rename": "kordalo.regional.rename_vat_settings",
+	},
 	"Address": {
 		"validate": [
 			"kordalo.regional.italy.utils.set_state_code",
@@ -434,8 +448,11 @@ doc_events = {
 	},
 	"Contact": {
 		"on_trash": "kordalo.support.doctype.issue.issue.update_issue",
-		"after_insert": "kordalo.telephony.doctype.call_log.call_log.link_existing_conversations",
+		"on_update": "kordalo.telephony.doctype.call_log.call_log.link_existing_conversations",
 		"validate": ["kordalo.crm.utils.update_lead_phone_numbers"],
+	},
+	"Lead": {
+		"on_update": "kordalo.telephony.doctype.call_log.call_log.link_existing_conversations",
 	},
 	"Email Unsubscribe": {
 		"after_insert": "kordalo.crm.doctype.email_campaign.email_campaign.unsubscribe_recipient"
@@ -474,6 +491,7 @@ scheduler_events = {
 	},
 	"hourly": [
 		"kordalo.projects.doctype.project.project.hourly_reminder",
+		"kordalo.support.doctype.service_level_agreement.service_level_agreement.fail_overdue_agreements",
 	],
 	"hourly_long": [],
 	"hourly_maintenance": [

@@ -5,7 +5,7 @@
 ARG FRAPPE_BRANCH=version-16
 
 FROM frappe/build:${FRAPPE_BRANCH} AS builder
-ARG FRAPPE_TAG=v16.53.0
+ARG FRAPPE_TAG=v16.54.0
 USER frappe
 RUN bench init \
       --frappe-branch=${FRAPPE_TAG} \
