@@ -16,6 +16,7 @@ from kordalo.buying.doctype.supplier_scorecard.supplier_scorecard import (
 from kordalo.buying.doctype.supplier_scorecard.supplier_scorecard import (
 	make_supplier_scorecard as make_scorecard_period,
 )
+from kordalo.buying.doctype.supplier_scorecard.supplier_scorecard_dashboard import get_data
 from kordalo.setup.doctype.employee.test_employee import make_employee
 from kordalo.tests.utils import KordaloTestSuite
 
@@ -158,6 +159,30 @@ class TestSupplierScorecard(KordaloTestSuite):
 		doc.supplier_score = 100
 		doc.update_standing()
 		self.assertEqual(doc.status, "Excellent")
+
+	def test_dashboard_endpoint_returns_connection_count_and_heatmap(self):
+		supplier = create_test_supplier("_Test Supplier SC Dashboard")
+		frappe.db.set_value("Supplier", supplier, "creation", add_days(nowdate(), -75))
+
+		frappe.delete_doc_if_exists("Supplier Scorecard", supplier)
+		doc = make_supplier_scorecard()
+		doc.supplier = supplier
+		doc.name = supplier
+		doc.insert()
+
+		endpoint = get_data().get("method") or "frappe.desk.notifications.get_open_count"
+		dashboard = frappe.get_attr(endpoint)("Supplier Scorecard", doc.name)
+
+		counts = {link["doctype"]: link["count"] for link in dashboard["count"]["external_links_found"]}
+		periods = frappe.db.count("Supplier Scorecard Period", {"supplier": supplier})
+		self.assertGreater(periods, 0)
+		self.assertEqual(counts["Supplier Scorecard Period"], periods)
+
+		timeline_data = dashboard["timeline_data"]
+		self.assertTrue(timeline_data)
+		for timestamp, score in timeline_data.items():
+			self.assertIsInstance(timestamp, int | float)
+			self.assertIsInstance(score, int | float)
 
 
 def make_supplier_scorecard():

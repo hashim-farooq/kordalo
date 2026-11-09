@@ -12,6 +12,7 @@ from frappe.utils import get_first_day as get_first_day_of_month
 from frappe.utils.nestedset import get_descendants_of
 
 from kordalo.accounts.utils import get_fiscal_year
+from kordalo.stock.doctype.company_restriction.company_restriction import get_allowed_masters_condition
 from kordalo.stock.doctype.warehouse.warehouse import apply_warehouse_filter
 from kordalo.stock.utils import is_reposting_item_valuation_in_progress
 
@@ -386,6 +387,9 @@ def get_item_details(items, sle):
 		)
 		.where(item_table.name.isin(items))
 	)
+
+	if condition := get_allowed_masters_condition(item_table.name, "Item"):
+		query = query.where(condition)
 
 	result = query.run(as_dict=1)
 
