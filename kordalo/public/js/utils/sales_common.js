@@ -81,7 +81,12 @@ kordalo.sales_common = {
 						}
 						return {
 							query: "kordalo.controllers.queries.item_query",
-							filters: { is_sales_item: 1, customer: customer, has_variants: 0 },
+							filters: {
+								is_sales_item: 1,
+								customer: customer,
+								has_variants: 0,
+								company: me.frm.doc.company,
+							},
 						};
 					});
 				}
@@ -280,6 +285,24 @@ kordalo.sales_common = {
 				}
 
 				this.set_actual_qty(doc, cdt, cdn);
+
+				if (cdt !== "Packed Item" && doc.packed_items) {
+					doc.packed_items
+						.filter(
+							(item) =>
+								item.parent_detail_docname === cdn ||
+								(/^\d+$/.test(String(item.parent_detail_docname)) &&
+									Number(item.parent_detail_docname) === locals[cdt][cdn].idx)
+						)
+						.forEach((item) => {
+							frappe.model.set_value(
+								item.doctype,
+								item.name,
+								"warehouse",
+								locals[cdt][cdn].warehouse
+							);
+						});
+				}
 			}
 
 			set_actual_qty(doc, cdt, cdn) {

@@ -22,6 +22,7 @@ from kordalo.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle impor
 from kordalo.stock.doctype.serial_no.serial_no import get_serial_nos
 from kordalo.stock.serial_batch_bundle import SerialBatchCreation
 from kordalo.stock.utils import _get_incoming_rate
+from kordalo.subcontracting.doctype.subcontracting_bom.subcontracting_bom import get_applicable_bom_items
 
 
 class SubcontractingController(StockController):
@@ -241,7 +242,7 @@ class SubcontractingController(StockController):
 								item.idx, item.item_name
 							)
 						)
-					if bom_item != item.item_code:
+					if bom_item not in get_applicable_bom_items(item.item_code):
 						frappe.throw(
 							_("Row {0}: Please select an valid BOM for Item {1}.").format(
 								item.idx, item.item_name
@@ -626,7 +627,7 @@ class SubcontractingController(StockController):
 		filters = [
 			[doctype, "parent", "=", bom_no],
 			[doctype, "docstatus", "=", 1],
-			["BOM", "item", "=", item_code],
+			["BOM", "item", "in", get_applicable_bom_items(item_code)],
 			[doctype, "sourced_by_supplier", "=", 0],
 		]
 

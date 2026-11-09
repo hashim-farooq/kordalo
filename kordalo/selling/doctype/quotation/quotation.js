@@ -204,14 +204,15 @@ kordalo.selling.QuotationController = class QuotationController extends kordalo.
 	set_dynamic_field_label() {
 		if (this.frm.doc.quotation_to == "Customer") {
 			this.frm.set_df_property("party_name", "label", "Customer");
-			this.frm.fields_dict.party_name.get_query = null;
+			this.frm.fields_dict.party_name.get_query = kordalo.queries.customer;
 		} else if (this.frm.doc.quotation_to == "Lead") {
 			this.frm.set_df_property("party_name", "label", "Lead");
 			this.frm.fields_dict.party_name.get_query = function () {
 				return { query: "kordalo.controllers.queries.lead_query" };
 			};
-		} else if (this.frm.doc.quotation_to == "Prospect") {
-			this.frm.set_df_property("party_name", "label", "Prospect");
+		} else if (this.frm.doc.quotation_to) {
+			// Prospect, CRM Deal: default search, without the Customer or Lead query
+			this.frm.set_df_property("party_name", "label", this.frm.doc.quotation_to);
 			this.frm.fields_dict.party_name.get_query = null;
 		}
 	}
