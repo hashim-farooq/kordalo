@@ -6,6 +6,11 @@ frappe.provide("kordalo.utils");
 const SALES_DOCTYPES = ["Quotation", "Sales Order", "Delivery Note", "Sales Invoice"];
 const PURCHASE_DOCTYPES = ["Supplier Quotation", "Purchase Order", "Purchase Receipt", "Purchase Invoice"];
 
+kordalo.utils.get_party_account_currency = function (party, company) {
+	// the server allows only accounts in the billing currency, or in the company currency without one
+	return party.default_currency || kordalo.get_currency(company);
+};
+
 kordalo.utils.get_party_details = function (frm, method, args, callback) {
 	if (!method) {
 		method = "kordalo.accounts.party.get_party_details";

@@ -2,7 +2,16 @@
 // License: GNU General Public License v3. See license.txt
 
 frappe.ui.form.on("Customer", {
+	restrict_to_companies(frm) {
+		if (!frm.doc.restrict_to_companies) {
+			frm.set_value("allowed_companies", []);
+		}
+	},
+
 	setup: function (frm) {
+		frm.set_query("allowed_companies", () => ({
+			query: "kordalo.stock.doctype.company_restriction.company_restriction.company_query",
+		}));
 		frm.custom_make_buttons = {
 			Opportunity: "Opportunity",
 			Quotation: "Quotation",
@@ -41,18 +50,14 @@ frappe.ui.form.on("Customer", {
 		frm.set_query("default_price_list", () => ({ filters: { selling: 1 } }));
 		frm.set_query("account", "accounts", function (doc, cdt, cdn) {
 			let d = locals[cdt][cdn];
-			let filters = {
-				account_type: "Receivable",
-				root_type: "Asset",
-				company: d.company,
-				is_group: 0,
-			};
-
-			if (doc.party_account_currency) {
-				$.extend(filters, { account_currency: doc.party_account_currency });
-			}
 			return {
-				filters: filters,
+				filters: {
+					account_type: "Receivable",
+					root_type: "Asset",
+					company: d.company,
+					is_group: 0,
+					account_currency: kordalo.utils.get_party_account_currency(doc, d.company),
+				},
 			};
 		});
 

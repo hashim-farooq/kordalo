@@ -4,10 +4,13 @@
 import frappe
 from frappe import _
 
+from kordalo.accounts.report.utils import validate_date_range
 from kordalo.stock.stock_ledger import set_as_cancel
 
 
 def execute(filters: dict | None = None):
+	validate_date_range(filters)
+
 	filters = frappe._dict(filters or {})
 	if not filters.company:
 		frappe.throw(_("Please select a Company"))

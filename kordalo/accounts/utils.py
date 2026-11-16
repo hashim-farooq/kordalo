@@ -39,6 +39,7 @@ import kordalo
 # imported to enable kordalo.accounts.utils.get_account_currency
 from kordalo.accounts.doctype.account.account import get_account_currency
 from kordalo.accounts.doctype.accounting_dimension.accounting_dimension import get_dimensions
+from kordalo.accounts.doctype.ledger_health.ledger_health import update_ledger_health
 from kordalo.stock import get_warehouse_account_map
 from kordalo.stock.utils import get_combine_datetime, get_stock_value_on
 
@@ -208,6 +209,7 @@ def get_balance_on(
 	start_date=None,
 	finance_book=None,
 	include_default_fb_balances=False,
+	apply_gl_entry_permissions=False,
 ):
 	if not account and frappe.form_dict.get("account"):
 		account = frappe.form_dict.get("account")
@@ -316,6 +318,9 @@ def get_balance_on(
 
 	cond.append("(gle.finance_book IS NULL OR gle.finance_book IN %s)")
 
+	if apply_gl_entry_permissions:
+		cond.extend(get_gl_entry_match_conditions())
+
 	if account or (party_type and party) or account_type:
 		precision = get_currency_precision()
 		if in_account_currency:
@@ -335,6 +340,18 @@ def get_balance_on(
 		)[0][0]
 		# if bal is None, return 0
 		return flt(bal)
+
+
+def get_gl_entry_match_conditions() -> list[str]:
+	"""The user's GL Entry permission conditions, for queries aliasing GL Entry as `gle`."""
+	from frappe.desk.reportview import build_match_conditions
+
+	match_conditions = build_match_conditions("GL Entry")
+	if not match_conditions:
+		return []
+	for quoted_table in ("`tabGL Entry`.", '"tabGL Entry".'):
+		match_conditions = match_conditions.replace(quoted_table, "gle.")
+	return [f"({match_conditions})"]
 
 
 def get_count_on(account, fieldname, date):
@@ -378,6 +395,7 @@ def get_count_on(account, fieldname, date):
 		else:
 			cond.append(f"""gle.account = {frappe.db.escape(account)} """)
 
+		# nosemgrep: frappe-semgrep-rules.rules.security.frappe-sql-format-injection -- values are escaped
 		entries = frappe.db.sql(
 			"""
 			SELECT name, posting_date, account, party_type, party,debit,credit,
@@ -756,6 +774,7 @@ def update_reference_in_payment_entry(
 			if existing_row.reference_doctype in advance_payment_doctypes:
 				new_row.advance_voucher_type = existing_row.reference_doctype
 				new_row.advance_voucher_no = existing_row.reference_name
+				new_row.payment_request = existing_row.payment_request
 
 			row = new_row
 
@@ -1096,8 +1115,10 @@ def remove_ref_doc_link_from_pe(
 		update_payment_requests_as_per_pe_references,
 	)
 
-	# Update payment request amount
-	update_payment_requests_as_per_pe_references(reference_rows, cancel=True)
+	# An allocated advance goes back to the payment entry as unallocated, so its payment request stays paid
+	update_payment_requests_as_per_pe_references(
+		[row for row in reference_rows if not row.advance_voucher_no], cancel=True
+	)
 
 	# Update allocated amounts and modified fields in one go
 	(
@@ -1586,6 +1607,9 @@ def validate_field_number(doctype_name, docname, number_value, company, field_na
 def get_autoname_with_number(number_value, doc_title, company):
 	"""append title with prefix as number and suffix as company's abbreviation separated by '-'"""
 	company_abbr = frappe.get_cached_value("Company", company, "abbr")
+	if not company_abbr:
+		frappe.throw(_("Company {0} does not exist or has no abbreviation").format(company))
+
 	parts = [doc_title.strip(), company_abbr]
 
 	if cstr(number_value).strip():
@@ -1702,6 +1726,7 @@ def repost_gle_for_stock_vouchers(
 				_delete_accounting_ledger_entries(voucher_type, voucher_no)
 
 		if not frappe.in_test:
+			# nosemgrep: frappe-semgrep-rules.rules.frappe-manual-commit -- background job saves progress or failure status
 			frappe.db.commit()
 
 		if repost_doc:
@@ -2601,78 +2626,84 @@ def get_advance_payment_doctypes(payment_type=None):
 
 def run_ledger_health_checks():
 	health_monitor_settings = frappe.get_doc("Ledger Health Monitor")
-	if health_monitor_settings.enable_health_monitor:
-		period_end = getdate()
-		period_start = add_days(period_end, -abs(health_monitor_settings.monitor_for_last_x_days))
+	if not health_monitor_settings.enable_health_monitor:
+		return
 
-		run_date = get_datetime()
+	period_end = getdate()
+	period_start = add_days(period_end, -abs(health_monitor_settings.monitor_for_last_x_days))
+	companies = [x.company for x in health_monitor_settings.companies]
+	scan = frappe._dict(companies=companies, from_date=period_start, to_date=period_end)
+	run_date = get_datetime()
 
-		# Debit-Credit mismatch report
-		if health_monitor_settings.debit_credit_mismatch:
-			for x in health_monitor_settings.companies:
-				filters = {"company": x.company, "from_date": period_start, "to_date": period_end}
-				voucher_wise = frappe.get_doc("Report", "Voucher-wise Balance")
-				res = voucher_wise.execute_script_report(filters=filters)
-				for x in res[1]:
-					doc = frappe.new_doc("Ledger Health")
-					doc.voucher_type = x.voucher_type
-					doc.voucher_no = x.voucher_no
-					doc.debit_credit_mismatch = True
-					doc.checked_on = run_date
-					doc.save()
+	if health_monitor_settings.debit_credit_mismatch:
+		vouchers = get_vouchers_reported_by(
+			"Voucher-wise Balance", companies, {"from_date": period_start, "to_date": period_end}
+		)
+		update_ledger_health("debit_credit_mismatch", vouchers, run_date, scan)
 
-		# General Ledger and Payment Ledger discrepancy
-		if health_monitor_settings.general_and_payment_ledger_mismatch:
-			for x in health_monitor_settings.companies:
-				filters = {
-					"company": x.company,
-					"period_start_date": period_start,
-					"period_end_date": period_end,
-				}
-				gl_pl_comparison = frappe.get_doc("Report", "General and Payment Ledger Comparison")
-				res = gl_pl_comparison.execute_script_report(filters=filters)
-				for x in res[1]:
-					doc = frappe.new_doc("Ledger Health")
-					doc.voucher_type = x.voucher_type
-					doc.voucher_no = x.voucher_no
-					doc.general_and_payment_ledger_mismatch = True
-					doc.checked_on = run_date
-					doc.save()
+	if health_monitor_settings.general_and_payment_ledger_mismatch:
+		vouchers = get_vouchers_reported_by(
+			"General and Payment Ledger Comparison",
+			companies,
+			{"period_start_date": period_start, "period_end_date": period_end},
+		)
+		update_ledger_health("general_and_payment_ledger_mismatch", vouchers, run_date, scan)
+
+
+def get_vouchers_reported_by(report_name, companies, filters):
+	report = frappe.get_doc("Report", report_name)
+	vouchers = set()
+	for company in companies:
+		data = report.execute_script_report(filters={"company": company, **filters})[1]
+		vouchers.update((row.voucher_type, row.voucher_no) for row in data)
+
+	return vouchers
 
 
 def sync_auto_reconcile_config(auto_reconciliation_job_trigger: int = 15):
-	auto_reconciliation_job_trigger = auto_reconciliation_job_trigger or frappe.get_single_value(
-		"Accounts Settings", "auto_reconciliation_job_trigger"
+	auto_reconciliation_job_trigger = (
+		auto_reconciliation_job_trigger
+		or frappe.get_single_value("Accounts Settings", "auto_reconciliation_job_trigger")
+		or 15
 	)
 	method = "kordalo.accounts.doctype.process_payment_reconciliation.process_payment_reconciliation.trigger_reconciliation_for_queued_docs"
 
-	sch_event = frappe.get_doc(
-		"Scheduler Event", {"scheduled_against": "Process Payment Reconciliation", "method": method}
-	)
-	if frappe.db.get_value("Scheduled Job Type", {"method": method}):
+	event_filters = {"scheduled_against": "Process Payment Reconciliation", "method": method}
+	# Serialize registration so concurrent settings saves cannot create duplicate records.
+	frappe.db.get_value("DocType", "Scheduler Event", "name", for_update=True)
+	sch_event = frappe.db.get_value("Scheduler Event", event_filters, "name")
+	if not sch_event:
+		sch_event = (
+			frappe.get_doc({"doctype": "Scheduler Event", **event_filters})
+			.insert(ignore_permissions=True)
+			.name
+		)
+	job_name = frappe.db.get_value("Scheduled Job Type", {"method": method}, "name")
+	if job_name:
 		frappe.get_doc(
 			"Scheduled Job Type",
-			{
-				"method": method,
-			},
+			job_name,
 		).update(
 			{
 				"cron_format": f"0/{auto_reconciliation_job_trigger} * * * *",
-				"scheduler_event": sch_event.name,
+				"scheduler_event": sch_event,
+				"frequency": "Cron",
+				"create_log": True,
+				"stopped": False,
 			}
-		).save()
+		).save(ignore_permissions=True)
 	else:
 		frappe.get_doc(
 			{
 				"doctype": "Scheduled Job Type",
 				"method": method,
-				"scheduler_event": sch_event.name,
+				"scheduler_event": sch_event,
 				"cron_format": f"0/{auto_reconciliation_job_trigger} * * * *",
 				"create_log": True,
 				"stopped": False,
 				"frequency": "Cron",
 			}
-		).save()
+		).insert(ignore_permissions=True)
 
 
 def get_link_fields_grouped_by_option(doctype):

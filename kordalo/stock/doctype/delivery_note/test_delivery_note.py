@@ -10,8 +10,10 @@ from frappe.utils import add_days, cstr, flt, getdate, nowdate, nowtime, today
 
 from kordalo.accounts.doctype.account.test_account import get_inventory_account
 from kordalo.accounts.doctype.cost_center.test_cost_center import create_cost_center
+from kordalo.accounts.doctype.sales_invoice.sales_invoice import make_sales_return as make_invoice_return
 from kordalo.accounts.utils import get_balance_on
 from kordalo.controllers.accounts_controller import InvalidQtyError
+from kordalo.selling.doctype.customer.customer import get_customer_outstanding
 from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
 from kordalo.selling.doctype.sales_order.test_sales_order import (
 	compare_payment_schedules,
@@ -21,6 +23,7 @@ from kordalo.selling.doctype.sales_order.test_sales_order import (
 from kordalo.stock.doctype.delivery_note.delivery_note import (
 	make_delivery_trip,
 	make_sales_invoice,
+	make_sales_return,
 )
 from kordalo.stock.doctype.delivery_trip.test_delivery_trip import create_driver
 from kordalo.stock.doctype.item.test_item import make_item
@@ -40,6 +43,7 @@ from kordalo.stock.doctype.stock_reconciliation.test_stock_reconciliation import
 	set_valuation_method,
 )
 from kordalo.stock.doctype.warehouse.test_warehouse import get_warehouse
+from kordalo.stock.serial_batch_bundle import get_batches_from_bundle
 from kordalo.stock.stock_ledger import get_previous_sle
 from kordalo.tests.utils import KordaloTestSuite
 
@@ -57,6 +61,192 @@ class TestDeliveryNote(KordaloTestSuite):
 		dn.items[0].qty = 1
 		dn.save()
 		self.assertEqual(dn.items[0].qty, 1)
+
+	def test_credit_limit_with_sales_order_bypass(self):
+		from kordalo.selling.doctype.customer.test_customer import make_customer
+
+		customer = frappe.get_doc("Customer", make_customer("_Test Delivery Credit Bypass"))
+		customer.append(
+			"credit_limits",
+			{"company": "_Test Company", "credit_limit": 1000, "bypass_credit_limit_check": 1},
+		)
+		customer.save()
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=11, basic_rate=100)
+
+		# A submitted standalone delivery is already in customer outstanding, so it is not counted twice.
+		create_delivery_note(customer=customer.name, qty=3, rate=100)
+
+		# Earlier unbilled deliveries against Sales Orders still count once the order check is bypassed.
+		so = make_sales_order(customer=customer.name, qty=4, rate=100)
+		create_dn_against_so(so.name, 4)
+		so = make_sales_order(customer=customer.name, qty=4, rate=100)
+		self.assertRaises(frappe.ValidationError, create_dn_against_so, so.name, 4)
+
+	def test_customer_outstanding_uses_delivery_base_net_amount(self):
+		from kordalo.selling.doctype.customer.customer import get_customer_outstanding
+		from kordalo.selling.doctype.customer.test_customer import make_customer
+
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=6, basic_rate=100)
+		for customer, currency, conversion_rate, discount_percentage in (
+			(make_customer("_Test Delivery Credit INR"), "INR", 1, 10),
+			("_Test Customer USD", "USD", 80, 0),
+			("_Test Customer USD", "USD", 80, 10),
+		):
+			with self.subTest(currency=currency, discount_percentage=discount_percentage):
+				outstanding = get_customer_outstanding(customer, "_Test Company", True)
+				dn = create_delivery_note(
+					customer=customer, currency=currency, qty=2, rate=300, do_not_save=True
+				)
+				dn.conversion_rate = conversion_rate
+				dn.apply_discount_on = "Net Total"
+				dn.additional_discount_percentage = discount_percentage
+				dn.insert()
+				dn.submit()
+				self.assertEqual(dn.base_grand_total, 600 * conversion_rate * (1 - discount_percentage / 100))
+				self.assertAlmostEqual(
+					get_customer_outstanding(customer, dn.company, True) - outstanding, dn.base_grand_total
+				)
+
+				# Billing moves exposure from the Delivery Note to the receivable without changing its total.
+				for billed_qty in (1, 1):
+					invoice = make_sales_invoice(dn.name)
+					invoice.items[0].qty = billed_qty
+					invoice.insert()
+					invoice.submit()
+					self.assertAlmostEqual(
+						get_customer_outstanding(customer, dn.company, True) - outstanding,
+						dn.base_grand_total,
+					)
+
+	def test_delivery_outstanding_clears_with_invoice_discount_and_exchange_rate(self):
+		from kordalo.selling.doctype.customer.customer import get_customer_outstanding
+
+		customer = "_Test Customer USD"
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		outstanding = get_customer_outstanding(customer, "_Test Company", True)
+		dn = create_delivery_note(customer=customer, currency="USD", qty=2, rate=300, do_not_save=True)
+		dn.conversion_rate = 80
+		dn.insert()
+		dn.submit()
+
+		billed_amount = 0
+		for remaining_qty in (1, 0):
+			invoice = make_sales_invoice(dn.name)
+			invoice.items[0].qty = 1
+			invoice.conversion_rate = 70
+			invoice.apply_discount_on = "Net Total"
+			invoice.additional_discount_percentage = 10
+			invoice.insert()
+			invoice.submit()
+			self.assertEqual(invoice.base_grand_total, 18900)
+			billed_amount += invoice.base_grand_total
+			self.assertAlmostEqual(
+				get_customer_outstanding(customer, dn.company, True) - outstanding,
+				billed_amount + dn.base_grand_total * remaining_qty / 2,
+			)
+
+	def test_customer_outstanding_excludes_returned_delivery_qty(self):
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=4, basic_rate=100)
+		outstanding = get_customer_outstanding("_Test Customer", "_Test Company", True)
+		dn = create_delivery_note(qty=4, rate=100)
+
+		dn_return = make_sales_return(dn.name)
+		dn_return.items[0].qty = -3
+		dn_return.insert()
+		dn_return = frappe.get_doc("Delivery Note", dn_return.name)
+		dn_return.submit()
+		dn.reload()
+		self.assertEqual(dn.items[0].returned_qty, 3)
+		self.assertEqual(get_customer_outstanding("_Test Customer", dn.company, True) - outstanding, 100)
+
+		invoice = make_sales_invoice(dn.name)
+		invoice.submit()
+		self.assertEqual(invoice.items[0].qty, 1)
+		self.assertEqual(get_customer_outstanding("_Test Customer", dn.company, True) - outstanding, 100)
+
+		invoice.reload()
+		invoice.cancel()
+		dn_return.cancel()
+		dn.reload()
+		self.assertEqual(dn.items[0].returned_qty, 0)
+		self.assertEqual(get_customer_outstanding("_Test Customer", dn.company, True) - outstanding, 400)
+
+		dn_return = make_sales_return(dn.name)
+		dn_return.insert()
+		frappe.get_doc("Delivery Note", dn_return.name).submit()
+		self.assertEqual(get_customer_outstanding("_Test Customer", dn.company, True) - outstanding, 0)
+
+	def test_customer_outstanding_after_billed_delivery_return(self):
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"uoms": [{"uom": "Box", "conversion_factor": 10}],
+			}
+		).name
+		for credit_source, conversion_factor in (
+			("Delivery Note", 1),
+			("Delivery Note", 10),
+			("Sales Invoice", 1),
+		):
+			with self.subTest(credit_source=credit_source, conversion_factor=conversion_factor):
+				make_stock_entry(
+					item_code=item, target="_Test Warehouse - _TC", qty=4 * conversion_factor, basic_rate=100
+				)
+				outstanding = get_customer_outstanding("_Test Customer", "_Test Company", True)
+				dn = create_delivery_note(
+					item_code=item, qty=4, rate=100 * conversion_factor, do_not_save=True
+				)
+				dn.items[0].update(
+					{
+						"uom": "Box" if conversion_factor == 10 else "Nos",
+						"conversion_factor": conversion_factor,
+					}
+				)
+				dn.insert()
+				dn.submit()
+				invoice = make_sales_invoice(dn.name)
+				invoice.items[0].qty = 2
+				invoice.submit()
+
+				dn_return = make_sales_return(dn.name)
+				dn_return.items[0].update(
+					{"uom": "Nos", "conversion_factor": 1, "qty": -conversion_factor, "rate": 100}
+				)
+				dn_return.issue_credit_note = credit_source == "Delivery Note"
+				dn_return.insert()
+				dn_return = frappe.get_doc("Delivery Note", dn_return.name)
+				dn_return.submit()
+				dn.reload()
+				self.assertEqual(dn.items[0].returned_qty, conversion_factor)
+
+				if credit_source == "Delivery Note":
+					credit_note = frappe.db.get_value(
+						"Sales Invoice Item", {"dn_detail": dn_return.items[0].name, "docstatus": 1}, "parent"
+					)
+					self.assertTrue(credit_note)
+					credit_note = frappe.get_doc("Sales Invoice", credit_note)
+				else:
+					credit_note = make_invoice_return(invoice.name)
+					credit_note.items[0].qty = -1
+					credit_note.submit()
+
+				self.assertEqual(
+					get_customer_outstanding("_Test Customer", dn.company, True) - outstanding,
+					300 * conversion_factor,
+				)
+				credit_note.reload()
+				credit_note.cancel()
+				self.assertEqual(
+					get_customer_outstanding("_Test Customer", dn.company, True) - outstanding,
+					300 * conversion_factor,
+				)
+				dn_return.reload()
+				dn_return.cancel()
+				self.assertEqual(
+					get_customer_outstanding("_Test Customer", dn.company, True) - outstanding,
+					400 * conversion_factor,
+				)
 
 	def test_over_billing_against_dn(self):
 		frappe.db.set_single_value("Stock Settings", "allow_negative_stock", 1)
@@ -358,9 +548,6 @@ class TestDeliveryNote(KordaloTestSuite):
 
 		self.assertEqual(gle_warehouse_amount, stock_value_difference)
 
-		# hack because new_doc isn't considering is_return portion of status_updater
-		returned = frappe.get_doc("Delivery Note", dn1.name)
-		returned.update_prevdoc_status()
 		dn.load_from_db()
 
 		# Check if Original DN updated
@@ -392,6 +579,8 @@ class TestDeliveryNote(KordaloTestSuite):
 		self.assertEqual(dn.per_billed, 0)
 
 		dn1.cancel()
+		# cancelling the return now reverses returned_qty on the original DN, so refresh before cancel
+		dn.load_from_db()
 		dn.cancel()
 
 	def test_sales_return_for_non_bundled_items_full(self):
@@ -427,9 +616,6 @@ class TestDeliveryNote(KordaloTestSuite):
 		dn1.items[0].dn_detail = dn.items[0].name
 		dn1.submit()
 
-		# hack because new_doc isn't considering is_return portion of status_updater
-		returned = frappe.get_doc("Delivery Note", dn1.name)
-		returned.update_prevdoc_status()
 		dn.load_from_db()
 
 		# Check if Original DN updated
@@ -569,7 +755,7 @@ class TestDeliveryNote(KordaloTestSuite):
 			qty=50,
 			rate=100,
 			company=company,
-			expense_account="Stock Adjustment - TCP1",
+			expense_account="Temporary Opening - TCP1",
 		)
 		create_stock_reconciliation(
 			item_code="_Test Item Home Desktop 100",
@@ -577,7 +763,7 @@ class TestDeliveryNote(KordaloTestSuite):
 			qty=50,
 			rate=100,
 			company=company,
-			expense_account="Stock Adjustment - TCP1",
+			expense_account="Temporary Opening - TCP1",
 		)
 
 		dn = create_delivery_note(
@@ -648,7 +834,7 @@ class TestDeliveryNote(KordaloTestSuite):
 			qty=50,
 			rate=100,
 			company=company,
-			expense_account="Stock Adjustment - TCP1",
+			expense_account="Temporary Opening - TCP1",
 		)
 		create_stock_reconciliation(
 			item_code="_Test Item Home Desktop 100",
@@ -656,7 +842,7 @@ class TestDeliveryNote(KordaloTestSuite):
 			qty=50,
 			rate=100,
 			company=company,
-			expense_account="Stock Adjustment - TCP1",
+			expense_account="Temporary Opening - TCP1",
 		)
 
 		actual_qty = get_qty_after_transaction(warehouse="Stores - TCP1")
@@ -849,6 +1035,8 @@ class TestDeliveryNote(KordaloTestSuite):
 
 		self.check_serial_no_values(serial_no, {"warehouse": ""})
 
+		# the return updated per_returned on the original DN, so refresh before cancelling it
+		dn.load_from_db()
 		dn.cancel()
 
 		self.check_serial_no_values(
@@ -920,14 +1108,14 @@ class TestDeliveryNote(KordaloTestSuite):
 				item_code="_Test Item",
 				warehouse=warehouse,
 				company=company,
-				expense_account="Stock Adjustment - TCP1",
+				expense_account="Temporary Opening - TCP1",
 				qty=500,
 				rate=100,
 			)
 			create_stock_reconciliation(
 				item_code="_Test Item Home Desktop 100",
 				company=company,
-				expense_account="Stock Adjustment - TCP1",
+				expense_account="Temporary Opening - TCP1",
 				warehouse=warehouse,
 				qty=500,
 				rate=100,
@@ -1504,6 +1692,427 @@ class TestDeliveryNote(KordaloTestSuite):
 		self.assertEqual(si2.items[0].qty, 2)
 		self.assertEqual(si2.items[1].qty, 1)
 
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_bundle_rows_of_a_repeated_serialized_component_get_their_own_serial_nos(self):
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		component = make_item(
+			properties={"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": "TRSC-.#####"}
+		).name
+		product_bundle = frappe.get_doc({"doctype": "Product Bundle", "new_item_code": bundle})
+		product_bundle.append("items", {"item_code": component, "qty": 1})
+		product_bundle.append("items", {"item_code": component, "qty": 2})
+		product_bundle.insert().submit()
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		dn = create_delivery_note(item_code=bundle, qty=1)
+
+		serial_nos = [get_serial_nos_from_bundle(row.serial_and_batch_bundle) for row in dn.packed_items]
+		self.assertEqual([len(numbers) for numbers in serial_nos], [1, 2])
+		self.assertFalse(set(serial_nos[0]) & set(serial_nos[1]))
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_bundle_rows_of_a_repeated_batched_component_do_not_overdraw_a_batch(self):
+		self.assertEqual(sorted(self.deliver_bundle_of_a_repeated_batched_component().values()), [1, 2])
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 1, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_bundle_rows_of_a_repeated_batched_component_do_not_overdraw_a_batch_with_batch_fields(self):
+		self.assertEqual(sorted(self.deliver_bundle_of_a_repeated_batched_component().values()), [1, 2])
+
+	def deliver_bundle_of_a_repeated_batched_component(self):
+		"""Return the qty picked from each batch by a bundle of 1 and 2 of the same batched component."""
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBC-.#####",
+			}
+		).name
+		product_bundle = frappe.get_doc({"doctype": "Product Bundle", "new_item_code": bundle})
+		product_bundle.append("items", {"item_code": component, "qty": 1})
+		product_bundle.append("items", {"item_code": component, "qty": 2})
+		product_bundle.insert().submit()
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		dn = create_delivery_note(item_code=bundle, qty=1)
+
+		picked = defaultdict(float)
+		for row in dn.packed_items:
+			for entry in frappe.get_all(
+				"Serial and Batch Entry",
+				filters={"parent": row.serial_and_batch_bundle},
+				fields=["batch_no", "qty"],
+			):
+				picked[entry.batch_no] += abs(entry.qty)
+		return picked
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 1, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	@KordaloTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_auto_picked_row_skips_batch_qty_of_a_row_with_batch_no_without_batch_fields(self):
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBF-.#####",
+			}
+		).name
+		se = make_stock_entry(item_code=item, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+		make_stock_entry(item_code=item, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+		first_batch = get_batch_from_bundle(se.items[0].serial_and_batch_bundle)
+
+		# e.g. through the REST API: a batch_no without use_serial_batch_fields
+		dn = create_delivery_note(item_code=item, qty=8, do_not_save=True)
+		dn.items[0].update({"batch_no": first_batch, "use_serial_batch_fields": 0})
+		dn.append("items", {**dn.items[0].as_dict(), "name": None, "idx": None, "qty": 5, "batch_no": None})
+		dn.items[1].use_serial_batch_fields = 1
+		dn.insert()
+		dn.submit()
+
+		self.assertEqual(get_batches_from_bundle(dn.items[1].serial_and_batch_bundle)[first_batch], -2)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	@KordaloTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_bundle_row_added_later_skips_batch_qty_of_saved_packed_rows(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBL-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		dn = create_delivery_note(item_code=bundle, qty=2, do_not_submit=True)
+		dn.save()
+		self.assertFalse(dn.packed_items[0].serial_and_batch_bundle)
+
+		dn.append(
+			"items",
+			{
+				"item_code": bundle,
+				"qty": 1,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.submit()
+
+		self.assertEqual(dn.docstatus, 1)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	@KordaloTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_packed_row_skips_batch_qty_of_a_packed_row_bundle_set_on_the_draft(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBD-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		se = make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+		first_batch = get_batch_from_bundle(se.items[0].serial_and_batch_bundle)
+
+		dn = create_delivery_note(item_code=bundle, qty=2, do_not_submit=True)
+		dn.packed_items[0].serial_and_batch_bundle = make_serial_batch_bundle(
+			{
+				"item_code": component,
+				"warehouse": "_Test Warehouse - _TC",
+				"qty": -2,
+				"batches": frappe._dict({first_batch: 2}),
+				"voucher_type": "Delivery Note",
+				"type_of_transaction": "Outward",
+				"do_not_submit": True,
+			}
+		).name
+		dn.append(
+			"items",
+			{
+				"item_code": bundle,
+				"qty": 1,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.submit()
+
+		self.assertNotEqual(get_batch_from_bundle(dn.packed_items[1].serial_and_batch_bundle), first_batch)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_packed_row_bundle_follows_bundle_qty_changed_on_a_saved_draft(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBQ-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		dn = create_delivery_note(item_code=bundle, qty=1, do_not_submit=True)
+		dn.save()
+		dn.items[0].qty = 2
+		dn.save()
+		dn.submit()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Serial and Batch Bundle", dn.packed_items[0].serial_and_batch_bundle, "total_qty"
+			),
+			-2,
+		)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_packed_row_bundle_made_at_submit_rejects_an_expired_batch(self):
+		from kordalo.exceptions import BatchExpiredError
+
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_serial_no": 1,
+				"serial_no_series": "TPSE-.#####",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TPBE-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		se = make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		batch_no = get_batch_from_bundle(se.items[0].serial_and_batch_bundle)
+		frappe.db.set_value("Batch", batch_no, "expiry_date", add_days(today(), -1))
+
+		dn = create_delivery_note(item_code=bundle, qty=1, do_not_submit=True)
+		self.assertRaises(BatchExpiredError, dn.submit)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_packed_row_skips_batch_qty_an_item_row_takes_by_batch_no(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBF-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		se = make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=2, basic_rate=100)
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		dn = create_delivery_note(
+			item_code=component,
+			qty=2,
+			batch_no=get_batch_from_bundle(se.items[0].serial_and_batch_bundle),
+			use_serial_batch_fields=1,
+			do_not_save=True,
+		)
+		dn.append(
+			"items",
+			{
+				"item_code": bundle,
+				"qty": 1,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.insert()
+		dn.submit()
+
+		self.assertEqual(dn.docstatus, 1)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_packed_row_of_removed_bundle_row_does_not_hold_batch_qty(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRBR-.#####",
+			}
+		).name
+		removed_bundle = make_item(properties={"is_stock_item": 0}).name
+		kept_bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(removed_bundle, [component])
+		make_product_bundle(kept_bundle, [component])
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=3, basic_rate=100)
+
+		dn = create_delivery_note(item_code=removed_bundle, qty=2, do_not_submit=True)
+		dn.save()
+		dn.append(
+			"items",
+			{
+				"item_code": kept_bundle,
+				"qty": 2,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.save()
+		dn.remove(dn.items[0])
+		dn.submit()
+
+		self.assertEqual(dn.docstatus, 1)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_item_row_skips_serial_nos_of_packed_row_of_same_item(self):
+		component = make_item(
+			properties={"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": "TRIP-.#####"}
+		).name
+		dn = self.make_dn_with_item_and_bundle_of(component, receipts=[10])
+
+		item_serial_nos = get_serial_nos_from_bundle(dn.items[0].serial_and_batch_bundle)
+		packed_serial_nos = get_serial_nos_from_bundle(dn.packed_items[0].serial_and_batch_bundle)
+		self.assertFalse(set(item_serial_nos) & set(packed_serial_nos))
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_item_row_skips_batch_qty_of_packed_row_of_same_item(self):
+		component = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRIPB-.#####",
+			}
+		).name
+		dn = self.make_dn_with_item_and_bundle_of(component, receipts=[1, 10])
+
+		self.assertEqual(dn.docstatus, 1)
+
+	def make_dn_with_item_and_bundle_of(self, component, receipts):
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		product_bundle = frappe.get_doc({"doctype": "Product Bundle", "new_item_code": bundle})
+		product_bundle.append("items", {"item_code": component, "qty": 1})
+		product_bundle.insert().submit()
+		for qty in receipts:
+			make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=qty, basic_rate=100)
+
+		dn = create_delivery_note(item_code=component, qty=1, do_not_submit=True)
+		dn.append(
+			"items",
+			{
+				"item_code": bundle,
+				"qty": 1,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.submit()
+		dn.reload()
+		return dn
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_item_row_picks_serial_no_of_removed_packed_row(self):
+		component = make_item(
+			properties={"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": "TRIPR-.#####"}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=1, basic_rate=100)
+
+		dn = create_delivery_note(item_code=bundle, qty=1, do_not_submit=True)
+		dn.save()
+		dn.items[0].item_code = component
+		dn.submit()
+
+		self.assertEqual(dn.docstatus, 1)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{"use_serial_batch_fields": 0, "auto_create_serial_and_batch_bundle_for_outward": 1},
+	)
+	def test_packed_row_of_removed_bundle_row_does_not_hold_serial_nos(self):
+		component = make_item(
+			properties={"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": "TRSR-.#####"}
+		).name
+		removed_bundle = make_item(properties={"is_stock_item": 0}).name
+		kept_bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(removed_bundle, [component])
+		make_product_bundle(kept_bundle, [component])
+		make_stock_entry(item_code=component, target="_Test Warehouse - _TC", qty=3, basic_rate=100)
+
+		dn = create_delivery_note(item_code=removed_bundle, qty=2, do_not_submit=True)
+		dn.save()
+		dn.append(
+			"items",
+			{
+				"item_code": kept_bundle,
+				"qty": 2,
+				"rate": 100,
+				"warehouse": "_Test Warehouse - _TC",
+				"cost_center": dn.items[0].cost_center,
+				"expense_account": dn.items[0].expense_account,
+			},
+		)
+		dn.save()
+		dn.remove(dn.items[0])
+		dn.save()
+		dn.submit()
+
+		self.assertEqual(len(get_serial_nos_from_bundle(dn.packed_items[0].serial_and_batch_bundle)), 2)
+
 	def test_delivery_note_bundle_with_batched_item(self):
 		frappe.db.set_single_value("Stock Settings", "use_serial_batch_fields", 0)
 
@@ -1554,14 +2163,14 @@ class TestDeliveryNote(KordaloTestSuite):
 		)
 		from kordalo.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
-		so = make_sales_order(uom="Nos", do_not_save=1)
+		so = make_sales_order(uom="_Test UOM", do_not_save=1)
 		create_payment_terms_template()
 		so.payment_terms_template = "Test Receivable Template"
 		so.submit()
 
 		dn = create_dn_against_so(so.name, delivered_qty=10)
 
-		si = create_sales_invoice(qty=10, do_not_save=1)
+		si = create_sales_invoice(qty=10, uom="_Test UOM", do_not_save=1)
 		si.items[0].delivery_note = dn.name
 		si.items[0].dn_detail = dn.items[0].name
 		si.items[0].sales_order = so.name
@@ -3193,7 +3802,8 @@ class TestDeliveryNote(KordaloTestSuite):
 		self.assertEqual(so.per_billed, 0)
 		self.assertEqual(so.per_delivered, 0)
 		self.assertEqual(so.items[0].delivered_qty, 0)
-		self.assertEqual(so.items[0].returned_qty, 0)
+		# delivered_qty is the net; returned_qty is the gross returned (full return of 2)
+		self.assertEqual(so.items[0].returned_qty, 2)
 
 		# Cancelling the credit note should restore the billed amount on the Sales Order.
 		credit_note.cancel()
@@ -3409,6 +4019,92 @@ class TestDeliveryNote(KordaloTestSuite):
 						entry.incoming_rate,
 						serial_batch_map[row.item_code].batch_no_valuation[entry.batch_no],
 					)
+
+	def test_sales_return_for_product_bundle_with_legacy_serial_nos(self):
+		bundle_item = make_item("_Packed Legacy Bundle Item", {"is_stock_item": 0}).name
+		stock_item = make_item("_Packed Legacy Stock Item", {"is_stock_item": 1}).name
+		serial_items = [
+			make_item(
+				f"_Packed Legacy Serial Item {i}",
+				{"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": f"SN-PACKED-LEGACY-{i}-.#####"},
+			).name
+			for i in (1, 2)
+		]
+		for item_code in [stock_item, *serial_items]:
+			make_stock_entry(item=item_code, target="_Test Warehouse - _TC", qty=2, rate=100)
+		make_product_bundle(bundle_item, [stock_item, *serial_items])
+
+		dn = create_delivery_note(item_code=bundle_item, warehouse="_Test Warehouse - _TC", qty=2)
+		dn.reload()
+
+		# Delivery notes from before v15 have serial nos in the packed items without a bundle
+		delivered_serial_nos = {}
+		for packed_item in dn.packed_items:
+			if packed_item.item_code not in serial_items:
+				continue
+
+			bundle = packed_item.serial_and_batch_bundle
+			serial_nos = get_serial_nos_from_bundle(bundle)
+			delivered_serial_nos[packed_item.item_code] = sorted(serial_nos)
+			legacy_values = {"serial_no": "\n".join(serial_nos), "serial_and_batch_bundle": None}
+			packed_item.db_set(legacy_values)
+			frappe.db.set_value(
+				"Stock Ledger Entry",
+				{"voucher_no": dn.name, "item_code": packed_item.item_code},
+				legacy_values,
+			)
+			frappe.db.delete("Serial and Batch Entry", {"parent": bundle})
+			frappe.db.delete("Serial and Batch Bundle", bundle)
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.submit()
+		return_dn.reload()
+
+		returned_serial_nos = {
+			row.item_code: sorted(get_serial_nos_from_bundle(row.serial_and_batch_bundle))
+			for row in return_dn.packed_items
+			if row.item_code in serial_items
+		}
+		self.assertEqual(returned_serial_nos, delivered_serial_nos)
+
+		# The return gets the stock value of the delivery: 2 units at 100
+		for item_code in serial_items:
+			stock_value_difference = frappe.db.get_value(
+				"Stock Ledger Entry",
+				{"voucher_no": return_dn.name, "item_code": item_code, "is_cancelled": 0},
+				"stock_value_difference",
+			)
+			self.assertEqual(stock_value_difference, 200)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"use_serial_batch_fields": 1})
+	def test_partial_sales_return_for_product_bundle_with_serial_fields_and_bundle(self):
+		bundle_item = make_item("_Packed Serial Fields Bundle Item", {"is_stock_item": 0}).name
+		serial_item = make_item(
+			"_Packed Serial Fields Serial Item",
+			{"is_stock_item": 1, "has_serial_no": 1, "serial_no_series": "SN-PACKED-FIELDS-.#####"},
+		).name
+		se = make_stock_entry(item=serial_item, target="_Test Warehouse - _TC", qty=2, rate=100)
+		delivered_serial_nos = get_serial_nos_from_bundle(se.items[0].serial_and_batch_bundle)
+		make_product_bundle(bundle_item, [serial_item])
+
+		# With serial / batch fields enabled, the packed item keeps its serial nos and gets a bundle
+		dn = create_delivery_note(
+			item_code=bundle_item, warehouse="_Test Warehouse - _TC", qty=2, do_not_submit=True
+		)
+		dn.packed_items[0].serial_no = "\n".join(delivered_serial_nos)
+		dn.submit()
+		dn.reload()
+		self.assertTrue(dn.packed_items[0].serial_no)
+		self.assertTrue(dn.packed_items[0].serial_and_batch_bundle)
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.items[0].qty = -1
+		return_dn.submit()
+		return_dn.reload()
+
+		returned_serial_nos = get_serial_nos_from_bundle(return_dn.packed_items[0].serial_and_batch_bundle)
+		self.assertEqual(len(returned_serial_nos), 1)
+		self.assertIn(returned_serial_nos[0], delivered_serial_nos)
 
 	def test_negative_stock_with_higher_precision(self):
 		original_flt_precision = frappe.db.get_default("float_precision")
@@ -4079,6 +4775,31 @@ class TestDeliveryNote(KordaloTestSuite):
 		amended.update({"docstatus": 0, "amended_from": delivery_note.name})
 		amended.insert()
 		self.assertIsNone(amended.delivery_trip)
+
+	def test_sales_team_disabled_sales_person_carried_over(self):
+		sales_person = "_Test Sales Person 2"
+		other_sales_person = "_Test Sales Person 1"
+
+		dn = create_delivery_note(do_not_submit=True)
+		dn.append("sales_team", {"sales_person": sales_person, "allocated_percentage": 100})
+		dn.submit()
+
+		frappe.db.set_value("Sales Person", sales_person, "enabled", 0)
+		frappe.db.set_value("Sales Person", other_sales_person, "enabled", 0)
+		try:
+			with self.subTest("invoice against the delivery note is allowed"):
+				si = make_sales_invoice(dn.name)
+				si.save()
+				self.assertEqual([d.sales_person for d in si.sales_team], [sales_person])
+
+			with self.subTest("sales person newly assigned on the invoice is rejected"):
+				si = make_sales_invoice(dn.name)
+				si.sales_team = []
+				si.append("sales_team", {"sales_person": other_sales_person, "allocated_percentage": 100})
+				self.assertRaisesRegex(frappe.ValidationError, "is disabled", si.save)
+		finally:
+			frappe.db.set_value("Sales Person", sales_person, "enabled", 1)
+			frappe.db.set_value("Sales Person", other_sales_person, "enabled", 1)
 
 
 def make_so_with_reserved_produced_serial_no():

@@ -8,6 +8,7 @@ import frappe
 from frappe.utils import flt
 
 from kordalo.buying.doctype.purchase_order.purchase_order import get_mapped_subcontracting_order
+from kordalo.controllers.item_variant import create_variant
 from kordalo.controllers.subcontracting_controller import (
 	get_materials_from_supplier,
 	make_rm_stock_entry,
@@ -45,6 +46,15 @@ class TestSubcontractingOrder(KordaloTestSuite):
 		make_raw_materials()
 		make_service_items()
 		make_bom_for_subcontracted_items()
+
+	def test_finished_good_qty_uses_item_stock_uom(self):
+		from kordalo.utilities.transaction_base import UOMMustBeIntegerError
+
+		sco = get_subcontracting_order(do_not_save=1)
+		sco.items[0].qty = 2.5
+		sco.items[0].stock_uom = "Kg"
+
+		self.assertRaises(UOMMustBeIntegerError, sco.save)
 
 	def test_set_missing_values(self):
 		sco = get_subcontracting_order()
@@ -264,6 +274,24 @@ class TestSubcontractingOrder(KordaloTestSuite):
 		sco.items[0].bom = draft_bom.name
 
 		self.assertRaises(frappe.ValidationError, sco.insert)
+
+	def test_variant_without_bom_uses_template_bom(self):
+		variant, template_bom = make_subcontracted_variant()
+		service_items = [
+			{
+				"warehouse": "_Test Warehouse - _TC",
+				"item_code": "Subcontracted Service Item 7",
+				"qty": 10,
+				"rate": 100,
+				"fg_item": variant.name,
+				"fg_item_qty": 10,
+			},
+		]
+
+		sco = get_subcontracting_order(service_items=service_items, do_not_submit=1)
+
+		self.assertEqual(sco.items[0].bom, template_bom.name)
+		self.assertEqual([d.rm_item_code for d in sco.supplied_items], ["Subcontracted Template RM Item"])
 
 	def test_make_rm_stock_entry(self):
 		sco = get_subcontracting_order()
@@ -1146,6 +1174,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 
 		self.assertEqual(sco.supplied_items[0].required_qty, 210.149)
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_stock_reservation(self):
 		from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 			get_sre_details_for_voucher,
@@ -1188,6 +1217,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 		)[:3]:
 			self.assertEqual(status, "Delivered")
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_closing_releases_stock_reservations(self):
 		from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import has_reserved_stock
 
@@ -1201,6 +1231,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 
 		self.assertFalse(has_reserved_stock(sco.doctype, sco.name))
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_closing_keeps_reservations_of_transferred_material(self):
 		sco = get_subcontracting_order(do_not_submit=1)
 		sco.reserve_stock = 1
@@ -1222,6 +1253,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 		for row in reservations:
 			self.assertEqual(row.docstatus, 1 if row.transferred_qty else 2)
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_closing_releases_unused_balance_of_partly_transferred_reservation(self):
 		sco = get_subcontracting_order(do_not_submit=1)
 		sco.reserve_stock = 1
@@ -1246,6 +1278,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 		self.assertEqual(reservation[0].reserved_qty, reservation[0].transferred_qty)
 		self.assertEqual(reservation[0].status, "Closed")
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_closing_releases_unused_batches_of_partly_transferred_reservation(self):
 		service_items = [
 			{
@@ -1290,6 +1323,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 			reservation = frappe.get_doc("Stock Reservation Entry", name)
 			self.assertLessEqual(reservation.transferred_qty, reservation.reserved_qty)
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_reservation_counts_supplied_qty(self):
 		service_items = [
 			{
@@ -1340,6 +1374,7 @@ class TestSubcontractingOrder(KordaloTestSuite):
 
 		self.assertEqual(sbe_pp_list, get_serial_batch_entries("Subcontracting Order", sco.name))
 
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
 	def test_closing_gives_the_unused_balance_back_to_the_plan(self):
 		plan = make_reserved_production_plan()
 		sco = make_subcontracting_order_from_plan(plan)
@@ -1585,6 +1620,26 @@ def make_subcontracted_purchase_order_from_material_request(material_request):
 	po.submit()
 
 	return po
+
+
+def make_subcontracted_variant():
+	template = make_item(
+		"Subcontracted Template Item",
+		{
+			"is_stock_item": 1,
+			"is_sub_contracted_item": 1,
+			"has_variants": 1,
+			"attributes": [{"attribute": "Test Size"}],
+		},
+	)
+	raw_material = make_item("Subcontracted Template RM Item", {"is_stock_item": 1})
+	template_bom = make_bom(item=template.name, raw_materials=[raw_material.name])
+
+	variant = create_variant(template.name, {"Test Size": "Small"})
+	variant.is_sub_contracted_item = 1
+	variant.insert()
+
+	return variant, template_bom
 
 
 def make_subcontracted_purchase_order(project):

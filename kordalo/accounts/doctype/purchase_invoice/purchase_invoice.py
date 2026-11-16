@@ -45,7 +45,14 @@ from kordalo.controllers.buying_controller import BuyingController, get_stock_qt
 from kordalo.controllers.mapper import get_qty_already_mapped
 from kordalo.projects.doctype.project.project import update_purchase_cost
 from kordalo.stock.doctype.purchase_receipt.purchase_receipt import (
+	get_billed_amount_against_po,
+	get_billed_amount_against_pr,
+	get_purchase_receipts_against_po_details,
+	set_qty_and_amount_net_of_returns,
 	update_billed_amount_based_on_po,
+)
+from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	cancel_stock_reservation_entries,
 )
 
 
@@ -242,6 +249,7 @@ class PurchaseInvoice(BuyingController):
 				"source_field": "amount",
 				"percent_join_field": "purchase_order",
 				"overflow_type": "billing",
+				"billing_flag": "update_billed_amount_in_purchase_order",
 				"extra_cond": """ and exists(select name from `tabPurchase Invoice`
 				where name=`tabPurchase Invoice Item`.parent and (is_return=0 or update_billed_amount_in_purchase_order=1))""",
 			}
@@ -331,16 +339,17 @@ class PurchaseInvoice(BuyingController):
 		if self.is_internal_transfer() or not kordalo.is_perpetual_inventory_enabled(self.company):
 			return
 
+		if frappe.db.get_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate"):
+			return
+
 		stock_items = self.get_stock_items()
 		receipts = {
 			item.purchase_receipt
 			for item in self.items
 			if item.purchase_receipt and item.item_code in stock_items
 		}
+		receipts.update(self.get_receipts_billed_through_order(stock_items))
 		if not receipts:
-			return
-
-		if frappe.db.get_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate"):
 			return
 
 		mismatched = [
@@ -367,6 +376,69 @@ class PurchaseInvoice(BuyingController):
 				get_link_to_form("Buying Settings", "Buying Settings", _("Buying Settings")),
 			)
 		)
+
+	def get_receipts_billed_through_order(self, stock_items):
+		if self.update_stock or self.is_return:
+			return set()
+
+		po_details = list(
+			{
+				item.po_detail
+				for item in self.items
+				if item.po_detail and not item.pr_detail and item.item_code in stock_items
+			}
+		)
+		if not po_details:
+			return set()
+
+		pr_items = get_purchase_receipts_against_po_details(po_details)
+		if not pr_items:
+			return set()
+
+		po_billed_amounts = get_billed_amount_against_po(po_details)
+		pr_billed_amounts = get_billed_amount_against_pr([item.name for item in pr_items])
+		for item in self.items:
+			if item.pr_detail:
+				pr_billed_amounts[item.pr_detail] = pr_billed_amounts.get(item.pr_detail, 0) + flt(
+					item.amount
+				)
+			elif item.po_detail in po_details:
+				billed = po_billed_amounts.setdefault(item.po_detail, {"billed_amt": 0, "billed_qty": 0})
+				billed["billed_amt"] += flt(item.amount)
+				billed["billed_qty"] += flt(item.qty)
+
+		set_qty_and_amount_net_of_returns(pr_items)
+		receipts_to_validate = set()
+		for pr_item in pr_items:
+			billed_details = po_billed_amounts.get(pr_item.purchase_order_item, {})
+			billed_amt_against_po = flt(billed_details.get("billed_amt"))
+			billed_qty_against_po = flt(billed_details.get("billed_qty"))
+			billed_amt_against_pr = flt(pr_billed_amounts.get(pr_item.name, 0))
+
+			if billed_amt_against_po and billed_amt_against_pr < pr_item.net_amount:
+				if (
+					not billed_amt_against_pr
+					and billed_qty_against_po
+					and billed_qty_against_po > pr_item.net_qty
+				):
+					billed_amt_against_pr = (
+						billed_amt_against_po * flt(pr_item.net_qty) / billed_qty_against_po
+					)
+					po_billed_amounts[pr_item.purchase_order_item]["billed_amt"] -= billed_amt_against_pr
+					po_billed_amounts[pr_item.purchase_order_item]["billed_qty"] -= pr_item.net_qty
+				else:
+					pending_to_bill = flt(pr_item.net_amount) - billed_amt_against_pr
+					consumed_amt = min(pending_to_bill, billed_amt_against_po)
+					billed_amt_against_pr += consumed_amt
+					po_billed_amounts[pr_item.purchase_order_item]["billed_amt"] -= consumed_amt
+					po_billed_amounts[pr_item.purchase_order_item]["billed_qty"] *= (
+						1 - consumed_amt / billed_amt_against_po
+					)
+
+			if flt(billed_amt_against_pr - flt(pr_item.billed_amt), self.precision("amount", "items")) > 0:
+				receipts_to_validate.add(pr_item.parent)
+
+		return receipts_to_validate
 
 	def validate_invoice_hold(self):
 		if self.is_return:
@@ -896,6 +968,9 @@ class PurchaseInvoice(BuyingController):
 
 		self.process_common_party_accounting()
 
+		if self.is_return and self.return_against:
+			frappe.get_doc(self.doctype, self.return_against).set_status(update=True)
+
 	def on_update_after_submit(self):
 		fields_to_check = [
 			"cash_bank_account",
@@ -904,8 +979,8 @@ class PurchaseInvoice(BuyingController):
 			"is_opening",
 		]
 		child_tables = {"items": ("expense_account",), "taxes": ("account_head",)}
-		self.needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
-		if self.needs_repost:
+		needs_repost = self.check_if_fields_updated(fields_to_check, child_tables)
+		if needs_repost:
 			self.validate_for_repost()
 			self.repost_accounting_entries()
 
@@ -1100,7 +1175,10 @@ class PurchaseInvoice(BuyingController):
 		)
 
 		for item in self.get("items"):
-			if flt(item.base_net_amount) or (self.get("update_stock") and item.valuation_rate):
+			if flt(item.base_net_amount) or (
+				self.get("update_stock")
+				and (item.valuation_rate or voucher_wise_stock_value.get((item.name, item.warehouse)))
+			):
 				if item.item_code:
 					frappe.get_cached_value("Item", item.item_code, "asset_category")
 
@@ -1478,10 +1556,9 @@ class PurchaseInvoice(BuyingController):
 
 	def make_stock_adjustment_entry(self, gl_entries, item, voucher_wise_stock_value, account_currency):
 		net_amt_precision = item.precision("base_net_amount")
-		val_rate_db_precision = 6 if cint(item.precision("valuation_rate")) <= 6 else 9
 
 		warehouse_debit_amount = flt(
-			flt(item.valuation_rate, val_rate_db_precision) * get_stock_qty(item, item.qty),
+			flt(item.valuation_rate) * get_stock_qty(item, item.qty),
 			net_amt_precision,
 		)
 
@@ -1837,17 +1914,24 @@ class PurchaseInvoice(BuyingController):
 				else:
 					round_off_account = round_off_for_opening
 
+			round_off_account_currency = get_account_currency(round_off_account)
 			gl_entries.append(
 				self.get_gl_dict(
 					{
 						"account": round_off_account,
 						"against": self.supplier,
-						"debit_in_account_currency": self.rounding_adjustment,
+						"debit_in_transaction_currency": flt(
+							self.rounding_adjustment, self.precision("rounding_adjustment")
+						),
+						"debit_in_account_currency": self.base_rounding_adjustment
+						if round_off_account_currency == self.company_currency
+						else self.rounding_adjustment,
 						"debit": self.base_rounding_adjustment,
 						"cost_center": round_off_cost_center
 						if self.use_company_roundoff_cost_center
 						else (self.cost_center or round_off_cost_center),
 					},
+					round_off_account_currency,
 					item=self,
 				)
 			)
@@ -1907,6 +1991,9 @@ class PurchaseInvoice(BuyingController):
 			"Quality Inspection",
 			"Tax Withholding Entry",
 		)
+
+		if self.is_return and self.return_against:
+			frappe.get_doc(self.doctype, self.return_against).set_status(update=True)
 
 	def update_project(self):
 		update_purchase_cost({d.project for d in self.items if d.project})

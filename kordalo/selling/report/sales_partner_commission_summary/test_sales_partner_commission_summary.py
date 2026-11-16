@@ -3,12 +3,21 @@
 
 import frappe
 from frappe import _
+from frappe.core.doctype.user_permission.test_user_permission import create_user
 from frappe.desk.query_report import run
+from frappe.permissions import add_user_permission, remove_user_permission
+from frappe.utils import getdate
 from frappe.utils.data import comma_or
 
+from kordalo.accounts.doctype.pos_closing_entry.pos_closing_entry import make_closing_entry_from_opening
+from kordalo.accounts.doctype.pos_invoice.test_pos_invoice import POSInvoiceTestMixin, create_pos_invoice
+from kordalo.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
+from kordalo.controllers.sales_and_purchase_return import make_return_doc
+from kordalo.selling.doctype.sales_order.test_sales_order import make_sales_order
 from kordalo.selling.report.sales_partner_commission_summary.sales_partner_commission_summary import (
 	SALES_TRANSACTION_DOCTYPES,
 )
+from kordalo.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
 from kordalo.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
 from kordalo.tests.utils import KordaloTestSuite
 
@@ -45,19 +54,11 @@ class SalesPartnerSummaryReportTestMixin(KordaloTestSuite):
 		self.assertNotEqual(posting_date_column.get("label"), "Order Date")
 
 	def create_transactions(self, doctype):
-		from kordalo.accounts.doctype.pos_invoice.test_pos_invoice import (
-			POSInvoiceTestMixin,
-			create_pos_invoice,
-		)
-		from kordalo.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
-		from kordalo.selling.doctype.sales_order.test_sales_order import make_sales_order
-		from kordalo.stock.doctype.delivery_note.test_delivery_note import create_delivery_note
-
 		make_transaction_funcs = {
 			"Sales Order": make_sales_order,
 			"Sales Invoice": create_sales_invoice,
 			"Delivery Note": create_delivery_note,
-			"POS Invoice": create_pos_invoice,
+			"POS Invoice": self.make_pos_invoice,
 		}
 		self.date_field = "transaction_date" if doctype == "Sales Order" else "posting_date"
 
@@ -74,10 +75,11 @@ class SalesPartnerSummaryReportTestMixin(KordaloTestSuite):
 
 		if doctype == "POS Invoice":
 			POSInvoiceTestMixin.setUp(self)
-
-			from kordalo.accounts.doctype.pos_opening_entry.test_pos_opening_entry import create_opening_entry
-
-			pos_opening_entry = create_opening_entry(self.pos_profile, self.test_user.name, get_obj=1)
+			make_stock_entry(
+				target="_Test Warehouse - _TC", qty=100, basic_rate=100, posting_date="2026-01-01"
+			)
+			self.enterContext(self.set_user(self.test_user.name))
+			self.opening_entry = None
 
 		self.transaction_doc_with_7pc_commision()
 		self.transaction_doc_with_5pc_commission()
@@ -92,8 +94,27 @@ class SalesPartnerSummaryReportTestMixin(KordaloTestSuite):
 
 		self.transaction_doc_returned()
 
-		if doctype == "POS Invoice":
-			pos_opening_entry.cancel()
+	def make_pos_invoice(self, **args):
+		self.open_pos_session(args["posting_date"])
+		return create_pos_invoice(**args)
+
+	def open_pos_session(self, posting_date):
+		if self.opening_entry:
+			if getdate(self.opening_entry.period_start_date) == getdate(posting_date):
+				return
+			closing = make_closing_entry_from_opening(self.opening_entry)
+			closing.flags.in_test = True
+			closing.submit()
+
+		self.opening_entry = frappe.get_doc(
+			doctype="POS Opening Entry",
+			company=self.pos_profile.company,
+			pos_profile=self.pos_profile.name,
+			user=self.test_user.name,
+			posting_date=posting_date,
+			period_start_date=f"{posting_date} 00:00:00",
+			balance_details=[{"mode_of_payment": "Cash", "opening_amount": 0}],
+		).submit()
 
 	def transaction_doc_with_7pc_commision(self):
 		args = {"rate": 100, "qty": 10, self.date_field: "2026-01-14", "do_not_save": 1}
@@ -217,8 +238,6 @@ class SalesPartnerSummaryReportTestMixin(KordaloTestSuite):
 		self.cancelled_doc.cancel()
 
 	def transaction_doc_returned(self):
-		from kordalo.controllers.sales_and_purchase_return import make_return_doc
-
 		args = {
 			"item_code": "_Test Item",
 			"rate": 90,
@@ -235,6 +254,9 @@ class SalesPartnerSummaryReportTestMixin(KordaloTestSuite):
 
 		self.to_be_returned_doc.save()
 		self.to_be_returned_doc.submit()
+
+		if self.to_be_returned_doc.doctype == "POS Invoice":
+			self.open_pos_session("2026-01-19")
 
 		self.returned_doc = make_return_doc(self.to_be_returned_doc.doctype, self.to_be_returned_doc.name)
 		self.returned_doc.posting_date = "2026-01-19"
@@ -263,11 +285,6 @@ class TestSalesPartnerCommissionSummary(SalesPartnerSummaryReportTestMixin):
 		self.assert_posting_date_label()
 
 	def test_company_restriction_not_leaked(self):
-		from frappe.core.doctype.user_permission.test_user_permission import create_user
-		from frappe.permissions import add_user_permission, remove_user_permission
-
-		from kordalo.selling.doctype.sales_order.test_sales_order import make_sales_order
-
 		so = make_sales_order(transaction_date="2026-01-14", do_not_save=1)
 		so.sales_partner = "_Test Sales Partner India - 1"
 		so.save()

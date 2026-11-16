@@ -9,6 +9,9 @@ from kordalo.selling.doctype.sales_order.test_sales_order import make_sales_orde
 from kordalo.stock.doctype.item.test_item import make_item
 from kordalo.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 from kordalo.stock.doctype.warehouse.test_warehouse import create_warehouse
+from kordalo.subcontracting.doctype.subcontracting_order.test_subcontracting_order import (
+	make_subcontracted_variant,
+)
 from kordalo.tests.permission_test_utils import as_user, make_fenced_user
 from kordalo.tests.utils import KordaloTestSuite
 
@@ -1694,6 +1697,15 @@ class IntegrationTestSubcontractingInwardOrder(KordaloTestSuite):
 
 		rm_return.cancel()
 		self.assertEqual(rm_return.docstatus, 2)
+
+	def test_variant_without_bom_uses_template_bom(self):
+		variant, template_bom = make_subcontracted_variant()
+		item_list = [{"item_code": "Service Item 1", "qty": 5, "fg_item": variant.name, "fg_item_qty": 5}]
+
+		so = make_sales_order(is_subcontracted=1, item_list=item_list)
+		scio = make_subcontracting_inward_order(so.name)
+
+		self.assertEqual(scio.items[0].bom, template_bom.name)
 
 
 def create_delivered_so_scio():
