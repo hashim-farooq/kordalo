@@ -11,12 +11,8 @@ kordalo.SerialBatchPackageSelector = class SerialNoBatchBundleUpdate {
 		this.init();
 	}
 
-	async init() {
-		try {
-			this.based_on = await kordalo.stock.get_pick_serial_batch_based_on();
-		} catch (e) {
-			this.based_on = "FIFO";
-		}
+	init() {
+		this.based_on = frappe.boot.sysdefaults.pick_serial_and_batch_based_on || "FIFO";
 
 		this.make();
 		this.render_data();
@@ -477,9 +473,7 @@ kordalo.SerialBatchPackageSelector = class SerialNoBatchBundleUpdate {
 						if (
 							(["Purchase Receipt", "Purchase Invoice"].includes(this.frm.doc.doctype) &&
 								!this.frm.doc.is_return) ||
-							(this.frm.doc.doctype === "Stock Entry" &&
-								(this.frm.doc.purpose === "Material Receipt" ||
-									(this.frm.doc.purpose === "Manufacture" && this.item.is_finished_item)))
+							(this.frm.doc.doctype === "Stock Entry" && !this.item.s_warehouse)
 						) {
 							is_inward = true;
 						}

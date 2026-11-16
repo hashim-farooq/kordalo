@@ -6,10 +6,13 @@ import frappe
 from frappe import _
 from frappe.utils import flt, getdate
 
+from kordalo.accounts.report.utils import validate_date_range
 from kordalo.stock.report.delayed_item_report.delayed_item_report import DelayedItemReport
 
 
 def execute(filters=None):
+	validate_date_range(filters)
+
 	columns, data = [], []
 
 	columns, data = DelayedOrderReport(filters).run()

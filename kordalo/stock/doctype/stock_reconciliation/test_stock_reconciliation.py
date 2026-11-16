@@ -5,6 +5,7 @@
 # For license information, please see license.txt
 
 import json
+from unittest.mock import patch
 
 import frappe
 from frappe.utils import add_days, cstr, flt, nowdate, nowtime
@@ -19,6 +20,7 @@ from kordalo.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle 
 )
 from kordalo.stock.doctype.stock_reconciliation.stock_reconciliation import (
 	EmptyStockReconciliationItemsError,
+	StockReconciliation,
 	get_items,
 	get_stock_balance_for,
 )
@@ -880,6 +882,53 @@ class TestStockReconciliation(KordaloTestSuite, StockTestMixin):
 		self.assertEqual(reco.difference_amount, 17500)
 		self.assert_reco_difference_matches_gl(reco.name)
 
+	def test_repost_refreshes_only_the_reposted_row(self):
+		from kordalo.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
+		from kordalo.stock.doctype.stock_reconciliation import stock_reconciliation
+
+		warehouse = "_Test Warehouse - _TC"
+		reposted_item, other_item = self.make_item().name, self.make_item().name
+		for item_code in (reposted_item, other_item):
+			make_stock_entry(
+				item_code=item_code,
+				target=warehouse,
+				qty=100,
+				basic_rate=100,
+				posting_date=add_days(nowdate(), -5),
+			)
+
+		reco = create_stock_reconciliation(
+			item_code=reposted_item,
+			warehouse=warehouse,
+			qty=100,
+			rate=200,
+			posting_date=add_days(nowdate(), -2),
+			do_not_save=True,
+		)
+		reco.append(
+			"items", {"item_code": other_item, "warehouse": warehouse, "qty": 100, "valuation_rate": 300}
+		)
+		reco.submit()
+		reposted_row = next(row.name for row in reco.items if row.item_code == reposted_item)
+
+		with patch.object(
+			stock_reconciliation,
+			"get_row_stock_value_difference",
+			wraps=stock_reconciliation.get_row_stock_value_difference,
+		) as get_row_difference:
+			make_stock_entry(
+				item_code=reposted_item,
+				target=warehouse,
+				qty=50,
+				basic_rate=40,
+				posting_date=add_days(nowdate(), -3),
+			)
+
+		self.assertEqual({call.args[2] for call in get_row_difference.call_args_list}, {reposted_row})
+		reco.load_from_db()
+		self.assertEqual(reco.difference_amount, (20000 - 12000) + (30000 - 10000))
+		self.assert_reco_difference_matches_gl(reco.name)
+
 	def test_difference_amount_synced_with_gl_after_repost_batched(self):
 		from kordalo.stock.doctype.landed_cost_voucher.test_landed_cost_voucher import (
 			make_landed_cost_voucher,
@@ -1239,6 +1288,140 @@ class TestStockReconciliation(KordaloTestSuite, StockTestMixin):
 		sr.reload()
 		self.assertTrue(sr.items[0].serial_and_batch_bundle)
 		self.assertFalse(sr.items[0].current_serial_and_batch_bundle)
+
+	def make_item_with_reserved_stock(self, properties):
+		"""Receive 3 units of a new item and reserve 1 for a Sales Order."""
+		from kordalo.selling.doctype.sales_order.test_sales_order import make_sales_order
+		from kordalo.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
+
+		item = self.make_item(properties={"is_stock_item": 1, **properties}).name
+		make_stock_entry(item_code=item, target="_Test Warehouse - _TC", qty=3, basic_rate=100)
+		sales_order = make_sales_order(
+			item_code=item, warehouse="_Test Warehouse - _TC", qty=1, do_not_submit=True
+		)
+		sales_order.reserve_stock = 1
+		sales_order.items[0].reserve_stock = 1
+		sales_order.submit()
+		return item, sales_order
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_reconcile_all_serial_batch_counts_reserved_stock(self):
+		warehouse = "_Test Warehouse - _TC"
+		for properties in (
+			{"has_serial_no": 1, "serial_no_series": "TRRS-.#####"},
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "TRRB-.#####"},
+		):
+			with self.subTest(properties=properties):
+				item, sales_order = self.make_item_with_reserved_stock(properties)
+
+				sr = create_stock_reconciliation(item_code=item, warehouse=warehouse, qty=3, rate=150)
+
+				self.assertEqual(sr.items[0].current_qty, 3)
+				self.assertEqual(
+					frappe.db.get_value("Bin", {"item_code": item, "warehouse": warehouse}, "actual_qty"), 3
+				)
+				self.assertEqual(
+					frappe.db.get_value(
+						"Stock Reservation Entry", {"voucher_no": sales_order.name}, "status"
+					),
+					"Reserved",
+				)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"enable_stock_reservation": 1, "use_serial_batch_fields": 1}
+	)
+	def test_serial_batch_fields_reconciliation_counts_reserved_serial_nos(self):
+		item, _sales_order = self.make_item_with_reserved_stock(
+			{"has_serial_no": 1, "serial_no_series": "TRRF-.#####"}
+		)
+
+		sr = create_stock_reconciliation(
+			item_code=item,
+			warehouse="_Test Warehouse - _TC",
+			qty=3,
+			rate=150,
+			use_serial_batch_fields=1,
+			reconcile_all_serial_batch=0,
+		)
+
+		self.assertEqual(sr.docstatus, 1)
+		self.assertEqual(len(get_serial_nos_from_bundle(sr.items[0].current_serial_and_batch_bundle)), 3)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"enable_stock_reservation": 1, "use_serial_batch_fields": 1}
+	)
+	def test_serial_batch_fields_reconciliation_of_a_batch_keeps_reserved_serial_nos(self):
+		item, sales_order = self.make_item_with_reserved_stock(
+			{
+				"has_serial_no": 1,
+				"serial_no_series": "TRRSB-.#####",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TRRSBB-.#####",
+			}
+		)
+
+		sr = create_stock_reconciliation(
+			item_code=item,
+			warehouse="_Test Warehouse - _TC",
+			qty=3,
+			rate=150,
+			batch_no=frappe.db.get_value("Batch", {"item": item}),
+			use_serial_batch_fields=1,
+			reconcile_all_serial_batch=0,
+		)
+
+		self.assertEqual(sr.docstatus, 1)
+		self.assertEqual(
+			frappe.db.get_value("Stock Reservation Entry", {"voucher_no": sales_order.name}, "status"),
+			"Reserved",
+		)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_reconciliation_cannot_move_stock_out_of_a_reserved_batch(self):
+		item, _sales_order = self.make_item_with_reserved_stock(
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "TRRM-.#####"}
+		)
+		new_batch = frappe.get_doc({"doctype": "Batch", "item": item, "batch_id": "TRRM-NEW"}).insert().name
+
+		self.assertRaises(
+			frappe.ValidationError,
+			create_stock_reconciliation,
+			item_code=item,
+			warehouse="_Test Warehouse - _TC",
+			qty=3,
+			rate=100,
+			batch_no=new_batch,
+		)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_batch_wise_reconciliation_counts_reserved_batch_qty(self):
+		item, _sales_order = self.make_item_with_reserved_stock(
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "TRRW-.#####"}
+		)
+		batch_no = frappe.db.get_value("Batch", {"item": item}, "name")
+
+		sr = create_stock_reconciliation(
+			item_code=item,
+			warehouse="_Test Warehouse - _TC",
+			qty=3,
+			rate=150,
+			batch_no=batch_no,
+			reconcile_all_serial_batch=0,
+		)
+
+		self.assertEqual(sr.docstatus, 1)
+		self.assertEqual(sr.items[0].current_qty, 3)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_reconcile_all_serial_nos_of_an_item_allowing_negative_stock_with_reserved_stock(self):
+		item, _sales_order = self.make_item_with_reserved_stock(
+			{"has_serial_no": 1, "serial_no_series": "TRRN-.#####", "allow_negative_stock": 1}
+		)
+
+		sr = create_stock_reconciliation(item_code=item, warehouse="_Test Warehouse - _TC", qty=3, rate=150)
+
+		self.assertEqual(sr.docstatus, 1)
 
 	def test_not_reconcile_all_batch(self):
 		from kordalo.stock.doctype.batch.batch import get_batch_qty
@@ -1869,6 +2052,96 @@ class TestStockReconciliation(KordaloTestSuite, StockTestMixin):
 
 		self.assertFalse(status == "Active")
 
+	def test_serial_nos_scoped_to_selected_batch(self):
+		from kordalo.stock.doctype.batch.batch import get_batch_qty
+		from kordalo.stock.doctype.stock_reconciliation.stock_reconciliation import get_stock_balance_for
+
+		item_code = self.make_item(
+			"Test Multi Batch Serial Item Reco",
+			{
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TMBSIR-BATCH-.###",
+				"has_serial_no": 1,
+				"serial_no_series": "TMBSIR-SN-.####",
+			},
+		).name
+		warehouse = "_Test Warehouse - _TC"
+
+		batch_wise_serial_nos = {}
+		for qty in (5, 3):
+			pr = make_purchase_receipt(
+				item_code=item_code,
+				warehouse=warehouse,
+				qty=qty,
+				rate=100,
+				posting_date=add_days(nowdate(), -3),
+			)
+			bundle = pr.items[0].serial_and_batch_bundle
+			batch_wise_serial_nos[get_batch_from_bundle(bundle)] = get_serial_nos_from_bundle(bundle)
+
+		first_batch, second_batch = batch_wise_serial_nos
+		serial_nos = batch_wise_serial_nos[second_batch]
+
+		data = get_stock_balance_for(
+			item_code,
+			warehouse,
+			nowdate(),
+			nowtime(),
+			batch_no=second_batch,
+			row={
+				"use_serial_batch_fields": 1,
+				"item_code": item_code,
+				"warehouse": warehouse,
+				"batch_no": second_batch,
+			},
+			company="_Test Company",
+		)
+
+		self.assertEqual(data["qty"], 3)
+		self.assertEqual(sorted(data["serial_nos"].split("\n")), sorted(serial_nos))
+
+		reco = create_stock_reconciliation(
+			item_code=item_code,
+			warehouse=warehouse,
+			qty=2,
+			rate=100,
+			batch_no=second_batch,
+			serial_no="\n".join(serial_nos[:2]),
+			use_serial_batch_fields=1,
+			reconcile_all_serial_batch=0,
+		)
+
+		reco.load_from_db()
+		self.assertEqual(reco.items[0].current_qty, 3)
+		self.assertEqual(
+			sorted(get_serial_nos_from_bundle(reco.items[0].current_serial_and_batch_bundle)),
+			sorted(serial_nos),
+		)
+		self.assertEqual(get_batch_qty(second_batch, warehouse, item_code), 2)
+		self.assertEqual(get_batch_qty(first_batch, warehouse, item_code), 5)
+
+		# Backdated fetch: the reco above already pulled serial_nos[2] out of the warehouse,
+		# but on the day before the reco all three batch serials were still in stock.
+		data = get_stock_balance_for(
+			item_code,
+			warehouse,
+			add_days(nowdate(), -1),
+			nowtime(),
+			batch_no=second_batch,
+			row={
+				"use_serial_batch_fields": 1,
+				"item_code": item_code,
+				"warehouse": warehouse,
+				"batch_no": second_batch,
+			},
+			company="_Test Company",
+		)
+
+		self.assertEqual(data["qty"], 3)
+		self.assertEqual(sorted(data["serial_nos"].split("\n")), sorted(serial_nos))
+
 	def test_change_valuation_of_batch_using_backdated_stock_reco(self):
 		from kordalo.stock.doctype.batch.batch import get_batch_qty
 		from kordalo.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
@@ -2488,6 +2761,119 @@ class TestStockReconciliation(KordaloTestSuite, StockTestMixin):
 		)
 		self.assertRaises(SerialNoExistsInFutureTransactionError, transfer.submit)
 
+	def test_backdated_entry_shifts_balance_across_batch_reconciliation(self):
+		from kordalo.stock.doctype.item.test_item import make_item
+		from kordalo.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
+
+		frappe.db.set_single_value("Stock Settings", "allow_negative_stock", 0)
+		item = make_item(
+			properties={
+				"valuation_method": "FIFO",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": f"{frappe.generate_hash(length=6)}-.###",
+			}
+		).name
+		warehouse = "_Test Warehouse - _TC"
+
+		receipt = make_stock_entry(
+			item_code=item, target=warehouse, qty=10, basic_rate=100, posting_date=add_days(nowdate(), -10)
+		)
+		first_batch = get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle)
+		reconciliation = create_stock_reconciliation(
+			item_code=item,
+			warehouse=warehouse,
+			qty=15,
+			rate=120,
+			batch_no=first_batch,
+			posting_date=add_days(nowdate(), -7),
+		)
+		issue = make_stock_entry(
+			item_code=item,
+			source=warehouse,
+			qty=3,
+			batch_no=first_batch,
+			use_serial_batch_fields=1,
+			posting_date=add_days(nowdate(), -6),
+		)
+
+		with patch.dict(frappe.flags, {"dont_execute_stock_reposts": True}):
+			backdated_receipt = make_stock_entry(
+				item_code=item, target=warehouse, qty=4, basic_rate=200, posting_date=add_days(nowdate(), -9)
+			)
+			second_batch = get_batch_from_bundle(backdated_receipt.items[0].serial_and_batch_bundle)
+
+			balances = frappe.get_all(
+				"Stock Ledger Entry",
+				filters={
+					"voucher_no": ("in", [reconciliation.name, issue.name]),
+					"item_code": item,
+					"is_cancelled": 0,
+				},
+				fields=["qty_after_transaction", "stock_value"],
+				order_by="posting_datetime, creation",
+			)
+			self.assertEqual(
+				[(flt(row.qty_after_transaction), flt(row.stock_value)) for row in balances],
+				[(4.0, 800.0), (19.0, 2600.0), (16.0, 2240.0)],
+			)
+
+			for batch_no, qty in ((second_batch, 4), (first_batch, 12)):
+				make_stock_entry(
+					item_code=item, source=warehouse, qty=qty, batch_no=batch_no, use_serial_batch_fields=1
+				)
+
+		last_entry = frappe.get_all(
+			"Stock Ledger Entry",
+			filters={"item_code": item, "warehouse": warehouse, "is_cancelled": 0},
+			fields=["qty_after_transaction", "stock_value"],
+			order_by="posting_datetime desc, creation desc",
+			limit=1,
+		)[0]
+		self.assertEqual((flt(last_entry.qty_after_transaction), flt(last_entry.stock_value)), (0.0, 0.0))
+
+	def test_landed_cost_before_batch_reconciliation_keeps_later_balances(self):
+		from kordalo.stock.doctype.item.test_item import make_item
+		from kordalo.stock.doctype.landed_cost_voucher.test_landed_cost_voucher import (
+			create_landed_cost_voucher,
+		)
+
+		item = make_item(
+			properties={
+				"valuation_method": "FIFO",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": f"{frappe.generate_hash(length=6)}-.###",
+			}
+		).name
+		warehouse = "_Test Warehouse - _TC"
+
+		receipt = make_purchase_receipt(
+			item_code=item, warehouse=warehouse, qty=6, rate=80, posting_date=add_days(nowdate(), -12)
+		)
+		reconciliation = create_stock_reconciliation(
+			item_code=item,
+			warehouse=warehouse,
+			qty=4,
+			rate=120,
+			batch_no=get_batch_from_bundle(receipt.items[0].serial_and_batch_bundle),
+			posting_date=add_days(nowdate(), -7),
+		)
+
+		with patch.dict(frappe.flags, {"dont_execute_stock_reposts": True}):
+			create_landed_cost_voucher("Purchase Receipt", receipt.name, receipt.company, charges=60)
+
+			balances = frappe.get_all(
+				"Stock Ledger Entry",
+				filters={"voucher_no": reconciliation.name, "item_code": item, "is_cancelled": 0},
+				fields=["qty_after_transaction", "stock_value"],
+				order_by="posting_datetime, creation",
+			)
+			self.assertEqual(
+				[(flt(row.qty_after_transaction), flt(row.stock_value)) for row in balances],
+				[(0.0, 0.0), (4.0, 480.0)],
+			)
+
 	def test_stock_balance_lookup_needs_reconciliation_write(self):
 		user = "reco-accounts-user@example.com"
 		if not frappe.db.exists("User", user):
@@ -2686,6 +3072,30 @@ class TestStockReconciliation(KordaloTestSuite, StockTestMixin):
 		sr = create_stock_reconciliation(item_code=item.name, rate=120)
 		self.assertEqual((sr.items[0].qty, sr.items[0].valuation_rate), (10, 120))
 		self.assertEqual(get_stock_value_on("_Test Warehouse - _TC", nowdate(), item.name), 1200)
+
+	def test_queued_submit_saves_the_current_version(self):
+		items = [self.make_item(properties={"is_stock_item": 1}).name for _ in range(11)]
+		warehouses = [create_warehouse(f"_Test Queued Reco Warehouse {i}") for i in range(10)]
+		sr = create_stock_reconciliation(item_code=items[0], warehouse=warehouses[0], do_not_save=True)
+		sr.set(
+			"items",
+			[
+				{"item_code": item_code, "warehouse": warehouse, "qty": 10, "valuation_rate": 100}
+				for item_code in items
+				for warehouse in warehouses
+			],
+		)
+		# the desk sets docstatus before it calls submit
+		sr.docstatus = 1
+
+		with patch.object(StockReconciliation, "queue_action") as queue_action:
+			sr.submit()
+			sr.items[0].qty = 20
+			sr.submit()
+
+		self.assertEqual(queue_action.call_count, 2)
+		self.assertEqual(frappe.db.get_value("Stock Reconciliation", sr.name, "docstatus"), 0)
+		self.assertEqual(frappe.db.get_value("Stock Reconciliation Item", sr.items[0].name, "qty"), 20)
 
 
 def create_batch_item_with_batch(item_name, batch_id):

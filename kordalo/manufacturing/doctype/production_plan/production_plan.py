@@ -29,16 +29,20 @@ from frappe.utils import (
 from frappe.utils.csvutils import build_csv_response
 from pypika.terms import ExistsCriterion
 
+import kordalo
 from kordalo.deprecation_dumpster import deprecated
 from kordalo.manufacturing.doctype.bom.bom import get_children as get_bom_children
-from kordalo.manufacturing.doctype.bom.bom import validate_bom_no
+from kordalo.manufacturing.doctype.bom.bom import validate_production_bom
 from kordalo.manufacturing.doctype.production_plan.work_order_quantities import (
 	ProductionPlanWorkOrderQuantities,
 )
 from kordalo.manufacturing.doctype.work_order.work_order import get_item_details
 from kordalo.setup.doctype.item_group.item_group import get_item_group_defaults
 from kordalo.stock.doctype.item.item import get_uom_conv_factor
-from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import StockReservation
+from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
+	StockReservation,
+	clear_reserve_stock_if_disabled,
+)
 from kordalo.stock.get_item_details import get_conversion_factor
 from kordalo.stock.utils import get_or_make_bin, validate_warehouse_company
 from kordalo.utilities.transaction_base import validate_uom_is_integer
@@ -78,6 +82,7 @@ class ProductionPlan(Document):
 		combine_sub_items: DF.Check
 		company: DF.Link
 		consider_minimum_order_qty: DF.Check
+		consider_process_loss: DF.Check
 		customer: DF.Link | None
 		for_warehouse: DF.Link | None
 		from_date: DF.Date | None
@@ -138,6 +143,7 @@ class ProductionPlan(Document):
 
 	def validate(self):
 		self.set_pending_qty_in_row_without_reference()
+		self.set_process_loss_percentage()
 		self.calculate_total_planned_qty()
 		self.set_status()
 		self._rename_temporary_references()
@@ -148,6 +154,7 @@ class ProductionPlan(Document):
 		self.validate_raw_material_group_warehouse()
 		if self.for_warehouse:
 			validate_warehouse_company(self.for_warehouse, self.company)
+		clear_reserve_stock_if_disabled(self)
 		self.enable_auto_reserve_stock()
 
 	def validate_raw_material_group_warehouse(self):
@@ -224,19 +231,19 @@ class ProductionPlan(Document):
 			if not item.get("sales_order") or not item.get("material_request"):
 				item.pending_qty = item.planned_qty
 
+	def set_process_loss_percentage(self):
+		for item in self.po_items:
+			item.process_loss_percentage = get_plan_process_loss_percentage(self, item.bom_no)
+
 	def calculate_total_planned_qty(self):
 		self.total_planned_qty = 0
 		for d in self.po_items:
 			self.total_planned_qty += flt(d.planned_qty)
 
 	def validate_data(self):
-		validated_boms = set()
 		for d in self.get("po_items"):
 			if not d.bom_no:
 				frappe.throw(_("Please select BOM for Item in Row {0}").format(d.idx))
-			elif (d.item_code, d.bom_no) not in validated_boms:
-				validate_bom_no(d.item_code, d.bom_no)
-				validated_boms.add((d.item_code, d.bom_no))
 
 			if not flt(d.planned_qty):
 				frappe.throw(
@@ -244,6 +251,15 @@ class ProductionPlan(Document):
 						d.idx, frappe.bold(d.item_code)
 					)
 				)
+
+		self.validate_boms()
+
+	def validate_boms(self):
+		"""Each BOM must produce the item of its row."""
+		boms = dict.fromkeys((d.item_code, d.bom_no) for d in self.po_items)
+		boms.update(dict.fromkeys((d.production_item, d.bom_no) for d in self.sub_assembly_items if d.bom_no))
+		for item_code, bom_no in boms:
+			validate_production_bom(item_code, bom_no)
 
 	def _rename_temporary_references(self):
 		"""po_items and sub_assembly_items items are both constructed client side without saving.
@@ -937,7 +953,12 @@ class ProductionPlan(Document):
 		pending = ProductionPlanWorkOrderQuantities(self.name).get_pending_quantities(self)
 		for row in self.sub_assembly_items:
 			if row.type_of_manufacturing == "Subcontract":
-				subcontracted_po.setdefault(row.supplier, []).append(row)
+				order_qty = ProductionPlanWorkOrderQuantities.get_order_qty(
+					row, "production_plan_sub_assembly_item"
+				)
+				subcontracted_po.setdefault(row.supplier, []).append(
+					frappe._dict(row.as_dict(), qty=order_qty)
+				)
 				continue
 
 			if row.type_of_manufacturing == "Material Request":
@@ -1220,7 +1241,7 @@ class ProductionPlan(Document):
 			if frappe.db.get_value("BOM", row.bom_no, "track_semi_finished_goods"):
 				frappe.msgprint(
 					_(
-						"Row #{0}: Since 'Produce an Item at Each Operation' is enabled, the BOM {1} cannot be used for Sub Assembly Items"
+						"Row #{0}: Since 'Produce Item per Operation' is enabled, the BOM {1} cannot be used for Sub Assembly Items"
 					).format(row.idx, row.bom_no)
 				)
 				continue
@@ -1230,14 +1251,16 @@ class ProductionPlan(Document):
 			track_semi_finished_goods = False
 
 			get_sub_assembly_items(
-				[item.production_item for item in sub_assembly_items_store],
 				bin_details,
 				row.bom_no,
 				bom_data,
-				row.planned_qty,
+				get_qty_before_process_loss(
+					row.planned_qty, get_plan_process_loss_percentage(self, row.bom_no), row.stock_uom
+				),
 				self.company,
 				warehouse=self.sub_assembly_warehouse,
 				skip_available_sub_assembly_item=self.skip_available_sub_assembly_item,
+				consider_process_loss=self.consider_process_loss,
 			)
 			self.set_sub_assembly_items_based_on_level(row, bom_data, manufacturing_type)
 			sub_assembly_items_store.extend(bom_data)
@@ -1462,6 +1485,7 @@ def download_raw_materials(doc, warehouses=None):
 			"Reserved Qty for Production",
 			"Safety Stock",
 			"Required Qty",
+			"UOM",
 		]
 	]
 
@@ -1469,13 +1493,16 @@ def download_raw_materials(doc, warehouses=None):
 	frappe.flags.show_qty_in_stock_uom = 1
 	items = get_items_for_material_requests(doc, warehouses=warehouses, get_parent_warehouse_data=True)
 
+	precision = frappe.get_precision("Material Request Plan Item", "quantity")
 	duplicate_item_wh_list = frappe._dict()
 
 	for d in items:
 		key = (d.get("item_code"), d.get("warehouse"))
 		if key in duplicate_item_wh_list:
-			rm_data = duplicate_item_wh_list[key]
-			rm_data[12] += d.get("quantity")
+			# transfer rows are in stock UOM and purchase rows in purchase UOM, so add in the row's UOM
+			merged = duplicate_item_wh_list[key]
+			merged.quantity += _stock_quantity(d) / merged.conversion_factor
+			merged.row[12] = flt(merged.quantity, precision)
 			continue
 
 		rm_data = [
@@ -1492,14 +1519,19 @@ def download_raw_materials(doc, warehouses=None):
 			d.get("reserved_qty_for_production"),
 			d.get("safety_stock"),
 			d.get("quantity"),
+			d.get("uom"),
 		]
 
-		duplicate_item_wh_list[key] = rm_data
+		duplicate_item_wh_list[key] = frappe._dict(
+			row=rm_data,
+			conversion_factor=flt(d.get("conversion_factor")) or 1,
+			quantity=flt(d.get("quantity")),
+		)
 		item_list.append(rm_data)
 
 		if not doc.get("for_warehouse"):
 			row = {"item_code": d.get("item_code")}
-			for bin_dict in get_bin_details(row, doc.company, all_warehouse=True):
+			for bin_dict in _get_bin_details(row, doc.company, all_warehouse=True):
 				if d.get("warehouse") == bin_dict.get("warehouse"):
 					continue
 
@@ -1508,11 +1540,13 @@ def download_raw_materials(doc, warehouses=None):
 						"",
 						"",
 						"",
+						"",
 						bin_dict.get("warehouse"),
 						"",
 						bin_dict.get("projected_qty", 0),
 						bin_dict.get("actual_qty", 0),
 						bin_dict.get("ordered_qty", 0),
+						bin_dict.get("planned_qty", 0),
 						bin_dict.get("reserved_qty_for_production", 0),
 					]
 				)
@@ -1569,6 +1603,39 @@ def get_exploded_items(item_details, company, bom_no, include_non_stock_items, p
 		item_details.setdefault(d.get("item_code"), d)
 
 	return item_details
+
+
+def get_planned_process_loss_percentage(bom_no):
+	"""BOM process loss % to add to the quantity, 0 when the BOM loses everything."""
+	return get_planned_loss_percentage(frappe.get_cached_value("BOM", bom_no, "process_loss_percentage"))
+
+
+def get_plan_process_loss_percentage(plan, bom_no):
+	"""BOM process loss % a Production Plan orders for, 0 unless it considers process loss."""
+	if not plan.get("consider_process_loss"):
+		return 0
+	return get_planned_process_loss_percentage(bom_no)
+
+
+def get_planned_loss_percentage(loss_percentage):
+	"""Process loss % to plan for, 0 when everything is lost."""
+	loss_percentage = flt(loss_percentage)
+	return loss_percentage if loss_percentage < 100 else 0
+
+
+def get_qty_before_process_loss(qty, loss_percentage, uom):
+	"""Quantity to make so that `qty` is left after `loss_percentage` process loss."""
+	loss_percentage = get_planned_loss_percentage(loss_percentage)
+	if not loss_percentage:
+		return flt(qty)
+	return round_up_to_whole_unit(flt(qty) / (1 - loss_percentage / 100), uom)
+
+
+def round_up_to_whole_unit(qty, uom):
+	"""A fraction of a whole number UOM cannot be made, so make the next whole unit."""
+	if uom and frappe.get_cached_value("UOM", uom, "must_be_whole_number"):
+		return ceil(flt(qty, frappe.get_precision("Work Order", "qty")))
+	return qty
 
 
 def get_uom_conversion_factor(item_code, uom):
@@ -1657,6 +1724,13 @@ def get_subitems(
 			_merge_subitem(item_details, d)
 
 		if explode:
+			qty = (
+				d.qty
+				if d.is_phantom_item
+				else get_qty_before_process_loss(
+					d.qty, get_plan_process_loss_percentage(doc, child_bom), d.stock_uom
+				)
+			)
 			get_subitems(
 				doc,
 				data,
@@ -1665,7 +1739,7 @@ def get_subitems(
 				company,
 				include_non_stock_items,
 				include_subcontracted_items,
-				d.qty,
+				qty,
 			)
 	return {key: value for key, value in item_details.items() if not value.get("is_phantom_item")}
 
@@ -1700,6 +1774,7 @@ def get_material_request_items(
 	bin_dict,
 	consumed_qty,
 	shortage_bin,
+	is_transfer=False,
 ):
 	required_qty = _required_qty_for_mr(
 		row, ignore_existing_ordered_qty, warehouse, shortage_bin, consumed_qty, include_safety_stock
@@ -1713,12 +1788,16 @@ def get_material_request_items(
 
 	uom = purchase_uom or row.get("stock_uom")
 	min_order_qty = flt(row.get("min_order_qty")) if doc.get("consider_minimum_order_qty") else 0
+	if is_transfer:  # whole stock UOM; what is left to purchase rounds later
+		quantity = round_up_whole_uom(required_qty, row.get("stock_uom")) / conversion_factor
+	else:
+		quantity = round_up_whole_uom(
+			_quantity_in_purchase_uom(required_qty, conversion_factor, min_order_qty), uom
+		)
 	return {
 		"item_code": row.item_code,
 		"item_name": row.item_name,
-		"quantity": round_up_whole_uom(
-			_quantity_in_purchase_uom(required_qty, conversion_factor, min_order_qty), uom
-		),
+		"quantity": quantity,
 		"conversion_factor": conversion_factor,
 		"required_bom_qty": row.get("qty"),
 		"stock_uom": row.get("stock_uom"),
@@ -1731,6 +1810,7 @@ def get_material_request_items(
 		"projected_qty": bin_dict.get("projected_qty", 0),
 		"ordered_qty": bin_dict.get("ordered_qty", 0),
 		"reserved_qty_for_production": bin_dict.get("reserved_qty_for_production", 0),
+		"planned_qty": bin_dict.get("planned_qty", 0),
 		"min_order_qty": row["min_order_qty"],
 		"material_request_type": row.get("default_material_request_type"),
 		"sales_order": sales_order,
@@ -1769,7 +1849,7 @@ def get_requested_sub_assemblies(doc):
 
 def round_up_whole_uom(quantity, uom):
 	if uom and frappe.get_cached_value("UOM", uom, "must_be_whole_number"):
-		return ceil(quantity)
+		return ceil(flt(quantity, frappe.get_precision("Material Request Plan Item", "quantity")))
 	return quantity
 
 
@@ -1969,13 +2049,20 @@ def _adjust_required_qty_for_uom(row, required_qty):
 
 @frappe.whitelist()
 def get_bin_details(row, company, for_warehouse=None, all_warehouse=False):
+	frappe.has_permission("Production Plan", "read", throw=True)
+	return _get_bin_details(row, company, for_warehouse, all_warehouse, ignore_permissions=False)
+
+
+def _get_bin_details(row, company, for_warehouse=None, all_warehouse=False, ignore_permissions=True):
 	if isinstance(row, str):
 		row = frappe._dict(json.loads(row))
 
 	bin = frappe.qb.DocType("Bin")
 	wh = frappe.qb.DocType("Warehouse")
 
-	subquery = frappe.qb.from_(wh).select(wh.name).where(wh.company == company)
+	subquery = frappe.qb.get_query("Warehouse", fields=["name"], ignore_permissions=ignore_permissions).where(
+		wh.company == company
+	)
 
 	warehouse = ""
 	if not all_warehouse:
@@ -2004,13 +2091,21 @@ def get_bin_details(row, company, for_warehouse=None, all_warehouse=False):
 
 @frappe.whitelist()
 def get_pooled_bin_details(row: str | dict, company: str, for_warehouse: str):
-	return _aggregate_bin_details(get_bin_details(row, company, for_warehouse))
+	frappe.has_permission("Production Plan", "read", throw=True)
+	return _aggregate_bin_details(_get_bin_details(row, company, for_warehouse, ignore_permissions=False))
 
 
 @frappe.whitelist()
 def get_so_details(sales_order):
+	# planners pick orders without a Sales Order role, as in sales_order_query
+	frappe.has_permission("Production Plan", throw=True)
+	kordalo.require_user_permission("Sales Order", sales_order)
+
 	return frappe.db.get_value(
-		"Sales Order", sales_order, ["transaction_date", "customer", "grand_total"], as_dict=1
+		"Sales Order",
+		{"name": sales_order, "docstatus": 1},
+		["transaction_date", "customer", "grand_total"],
+		as_dict=1,
 	)
 
 
@@ -2112,7 +2207,9 @@ def get_items_for_material_requests(
 
 			sub_assembly_items[
 				(d.get("production_item"), d.get("bom_no"), d.get("type_of_manufacturing"))
-			] += d.get("qty")
+			] += get_qty_before_process_loss(
+				d.get("qty"), d.get("process_loss_percentage"), d.get("stock_uom")
+			)
 		sub_assembly_items = {k[:2]: v for k, v in sub_assembly_items.items()}
 
 	requested_sub_assemblies = get_requested_sub_assemblies(doc)
@@ -2128,6 +2225,9 @@ def get_items_for_material_requests(
 		)
 
 		planned_qty = data.get("required_qty") or data.get("planned_qty")
+		if data.get("bom_no") and not data.get("required_qty"):
+			loss_percentage = get_plan_process_loss_percentage(doc, data.get("bom_no"))
+			planned_qty = get_qty_before_process_loss(planned_qty, loss_percentage, data.get("stock_uom"))
 		ignore_existing_ordered_qty = data.get("ignore_existing_ordered_qty") or ignore_existing_ordered_qty
 
 		item_details = {}
@@ -2237,9 +2337,9 @@ def get_items_for_material_requests(
 			fallback = details.get("source_warehouse") or details.get("default_warehouse")
 			row_scope_warehouse = scope_warehouse or fallback
 			row_target_warehouse = target_warehouse or fallback
-			# get_bin_details scopes to the warehouse's descendants, returning one row per
+			# _get_bin_details scopes to the warehouse's descendants, returning one row per
 			# child warehouse; sum them so a group warehouse reflects combined child stock.
-			bins = get_bin_details(details, doc.company, row_scope_warehouse)
+			bins = _get_bin_details(details, doc.company, row_scope_warehouse)
 			bin_dict = _aggregate_bin_details(bins)
 			shortage_warehouse, shortage_bin = row_scope_warehouse, bin_dict
 			if is_transfer and row_scope_warehouse != row_target_warehouse:
@@ -2261,6 +2361,7 @@ def get_items_for_material_requests(
 					bin_dict,
 					consumed_qty,
 					shortage_bin,
+					is_transfer,
 				)
 				if items:
 					mr_items.append(items)
@@ -2416,7 +2517,6 @@ def get_item_data(item_code):
 
 
 def get_sub_assembly_items(
-	sub_assembly_items,
 	bin_details,
 	bom_no,
 	bom_data,
@@ -2425,6 +2525,7 @@ def get_sub_assembly_items(
 	warehouse=None,
 	indent=0,
 	skip_available_sub_assembly_item=False,
+	consider_process_loss=False,
 ):
 	data = get_bom_children(parent=bom_no)
 	precision = frappe.get_precision("Production Plan Sub Assembly Item", "qty")
@@ -2435,10 +2536,10 @@ def get_sub_assembly_items(
 			required_qty = stock_qty
 
 			if warehouse and d.item_code not in bin_details:
-				bins = get_bin_details(d, company, for_warehouse=warehouse)
+				bins = _get_bin_details(d, company, for_warehouse=warehouse)
 				bin_details[d.item_code] = frappe._dict(_aggregate_bin_details(bins))
 
-			if skip_available_sub_assembly_item and d.item_code not in sub_assembly_items:
+			if skip_available_sub_assembly_item:
 				bin_dict = bin_details[d.item_code]
 				available_qty = bin_dict.get("available_qty", bin_dict.projected_qty)
 				if available_qty >= stock_qty:
@@ -2447,9 +2548,12 @@ def get_sub_assembly_items(
 				elif available_qty > 0:
 					bin_dict.available_qty = 0
 					stock_qty -= available_qty
-					sub_assembly_items.append(d.item_code)
 
 			if not d.is_phantom_item:
+				d.process_loss_percentage = (
+					get_planned_process_loss_percentage(d.value) if consider_process_loss else 0
+				)
+				stock_qty = round_up_to_whole_unit(stock_qty, d.stock_uom)
 				bom_data.append(
 					frappe._dict(
 						{
@@ -2466,15 +2570,16 @@ def get_sub_assembly_items(
 							"indent": indent,
 							"stock_qty": flt(stock_qty, precision),
 							"required_qty": flt(required_qty, precision),
+							"process_loss_percentage": d.process_loss_percentage,
 							"projected_qty": bin_details.get(d.item_code, {}).get("projected_qty", 0),
 							"main_bom": bom_no,
 						}
 					)
 				)
+				stock_qty = get_qty_before_process_loss(stock_qty, d.process_loss_percentage, d.stock_uom)
 
 			if d.value:
 				get_sub_assembly_items(
-					sub_assembly_items,
 					bin_details,
 					d.value,
 					bom_data,
@@ -2483,6 +2588,7 @@ def get_sub_assembly_items(
 					warehouse,
 					indent=indent + 1,
 					skip_available_sub_assembly_item=skip_available_sub_assembly_item,
+					consider_process_loss=consider_process_loss,
 				)
 
 
@@ -2538,10 +2644,7 @@ def _get_material_request_plan_query(item_code):
 		.select(
 			table.name.as_("production_plan"),
 			child.warehouse,
-			Sum(
-				Case().when(child.quantity == 0, child.required_bom_qty).else_(child.quantity)
-				* child.conversion_factor
-			).as_("reserved_qty"),
+			Sum(child.required_bom_qty).as_("reserved_qty"),
 		)
 		.where(_is_open_plan(table) & (child.item_code == item_code))
 		.groupby(table.name, child.warehouse)
@@ -2793,7 +2896,7 @@ def reserve_stock_for_production_plan(doc, items=None, table_name=None, notify=F
 		if table_name and table_name != child_table_name:
 			continue
 
-		sre = StockReservation(doc, items=items, kwargs=mapper[child_table_name], notify=notify)
+		sre = StockReservation(doc, items=items, kwargs=mapper[child_table_name])
 		if doc.docstatus == 1:
 			sre_created = sre.make_stock_reservation_entries()
 			if sre_created:

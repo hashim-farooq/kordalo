@@ -3,6 +3,7 @@
 
 
 import json
+from collections import defaultdict
 
 import frappe
 from frappe import _, throw
@@ -596,6 +597,7 @@ class PurchaseReceipt(BuyingController):
 
 			if (
 				item.get("rejected_qty")
+				and item.item_code in stock_items
 				and not self.is_internal_transfer()
 				and frappe.db.get_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials")
 			):
@@ -784,12 +786,16 @@ class PurchaseReceipt(BuyingController):
 				)
 
 		stock_items = self.get_stock_items()
+		perpetual_inventory = kordalo.is_perpetual_inventory_enabled(self.company)
 		warehouse_with_no_account = []
 
 		for d in self.get("items"):
 			remarks = self.get("remarks") or _("Accounting Entry for {0}").format(
 				"Asset" if d.is_fixed_asset else "Stock"
 			)
+			stock_value_diff = 0
+			if perpetual_inventory and d.item_code in stock_items and flt(d.qty):
+				stock_value_diff = get_stock_value_difference(self.name, d.name, d.warehouse)
 
 			if (
 				provisional_accounting_for_non_stock_items
@@ -801,9 +807,9 @@ class PurchaseReceipt(BuyingController):
 				self.add_provisional_gl_entry(
 					d, gl_entries, self.posting_date, d.get("provisional_expense_account")
 				)
-			elif flt(d.qty) and (flt(d.valuation_rate) or self.is_return):
+			elif flt(d.qty) and (flt(d.valuation_rate) or flt(stock_value_diff) or self.is_return):
 				if not (
-					(kordalo.is_perpetual_inventory_enabled(self.company) and d.item_code in stock_items)
+					(perpetual_inventory and d.item_code in stock_items)
 					or (d.is_fixed_asset and not d.purchase_invoice)
 				):
 					continue
@@ -820,7 +826,6 @@ class PurchaseReceipt(BuyingController):
 						flt(d.base_net_amount) + flt(d.item_tax_amount) + flt(d.landed_cost_voucher_amount)
 					)
 				elif inventory_account := self.get_inventory_account_dict(d, inventory_account_map):
-					stock_value_diff = get_stock_value_difference(self.name, d.name, d.warehouse)
 					stock_asset_account_name = inventory_account["account"]
 
 					supplier_warehouse_account = None
@@ -845,14 +850,13 @@ class PurchaseReceipt(BuyingController):
 					):
 						continue
 
-				if (flt(d.valuation_rate) or self.is_return or d.is_fixed_asset) and flt(d.qty):
-					make_item_asset_inward_gl_entry(d, stock_value_diff, stock_asset_account_name)
-					outgoing_amount = make_stock_received_but_not_billed_entry(d)
-					make_landed_cost_gl_entries(d)
-					make_expenses_added_to_stock_entries(d)
-					make_amount_difference_entry(d)
-					make_sub_contracting_gl_entries(d)
-					make_divisional_loss_gl_entry(d, outgoing_amount)
+				make_item_asset_inward_gl_entry(d, stock_value_diff, stock_asset_account_name)
+				outgoing_amount = make_stock_received_but_not_billed_entry(d)
+				make_landed_cost_gl_entries(d)
+				make_expenses_added_to_stock_entries(d)
+				make_amount_difference_entry(d)
+				make_sub_contracting_gl_entries(d)
+				make_divisional_loss_gl_entry(d, outgoing_amount)
 			elif (d.warehouse and d.qty and d.warehouse not in warehouse_with_no_account) or (
 				not frappe.db.get_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials")
 				and d.rejected_warehouse
@@ -863,7 +867,8 @@ class PurchaseReceipt(BuyingController):
 			if d.is_fixed_asset and d.landed_cost_voucher_amount:
 				self.update_assets(d, d.valuation_rate)
 
-			if d.rejected_qty and self.is_rejected_material_valued():
+			# a non-stock item puts no rejected qty in stock
+			if d.rejected_qty and d.item_code in stock_items and self.is_rejected_material_valued():
 				stock_asset_rbnb = (
 					self.get_company_default("asset_received_but_not_billed")
 					if d.is_fixed_asset
@@ -1055,6 +1060,7 @@ class PurchaseReceipt(BuyingController):
 		production_plan_items = []
 		self.reload()
 
+		unreserved_qty = self.get_unreserved_qty_for_production_plans(reservable_plans)
 		docnames = []
 		for row in self.items:
 			if row.material_request_item and row.material_request_item in production_plan_references:
@@ -1062,9 +1068,17 @@ class PurchaseReceipt(BuyingController):
 				if _ref.production_plan not in reservable_plans:
 					continue
 
+				key = (_ref.production_plan, row.item_code)
+				qty_to_reserve = flt(min(row.stock_qty, unreserved_qty[key]), row.precision("stock_qty"))
+				if qty_to_reserve <= 0:
+					continue
+
+				unreserved_qty[key] -= qty_to_reserve
 				docnames.append(_ref.production_plan)
-				row.update(
+				item = row.as_dict()
+				item.update(
 					{
+						"stock_qty": qty_to_reserve,
 						"voucher_type": "Production Plan",
 						"voucher_no": _ref.production_plan,
 						"voucher_detail_no": _ref.material_request_plan_item,
@@ -1075,7 +1089,7 @@ class PurchaseReceipt(BuyingController):
 					}
 				)
 
-				production_plan_items.append(row)
+				production_plan_items.append(item)
 
 		if not production_plan_items:
 			return
@@ -1086,6 +1100,41 @@ class PurchaseReceipt(BuyingController):
 			sre.transfer_reservation_entries_to(
 				docnames, from_doctype="Production Plan", to_doctype="Work Order"
 			)
+
+	def get_unreserved_qty_for_production_plans(self, plans: set) -> defaultdict:
+		unreserved_qty = defaultdict(float)
+
+		mr_item = frappe.qb.DocType("Material Request Plan Item")
+		required = (
+			frappe.qb.from_(mr_item)
+			.select(mr_item.parent, mr_item.item_code, Sum(mr_item.required_bom_qty))
+			.where(mr_item.parent.isin(list(plans)))
+			.groupby(mr_item.parent, mr_item.item_code)
+		).run()
+		for plan, item_code, qty in required:
+			unreserved_qty[(plan, item_code)] += flt(qty)
+
+		sre = frappe.qb.DocType("Stock Reservation Entry")
+		reserved = (
+			frappe.qb.from_(sre)
+			.select(sre.voucher_no, sre.item_code, Sum(sre.reserved_qty))
+			.where(
+				(sre.docstatus == 1)
+				& (sre.voucher_type == "Production Plan")
+				& sre.voucher_no.isin(list(plans))
+				& (
+					sre.voucher_detail_no.isin(
+						frappe.qb.from_(mr_item).select(mr_item.name).where(mr_item.parent.isin(list(plans)))
+					)
+					| (sre.from_voucher_type == "Purchase Receipt")
+				)
+			)
+			.groupby(sre.voucher_no, sre.item_code)
+		).run()
+		for plan, item_code, qty in reserved:
+			unreserved_qty[(plan, item_code)] -= flt(qty)
+
+		return unreserved_qty
 
 	def get_reservable_production_plans(self, production_plan_references) -> set:
 		"""Production Plans that opted into stock reservation (``reserve_stock``).
@@ -1201,14 +1250,15 @@ def update_billed_amount_based_on_po(po_details, update_modified=True, pr_doc=No
 				)
 			else:
 				pending_to_bill = flt(pr_item.net_amount) - billed_amt_against_pr
-				if pending_to_bill <= billed_amt_against_po:
-					billed_amt_against_pr += pending_to_bill
-					billed_amt_against_po -= pending_to_bill
-				else:
-					billed_amt_against_pr += billed_amt_against_po
-					billed_amt_against_po = 0
+				consumed_amt_against_po = min(pending_to_bill, billed_amt_against_po)
+				billed_amt_against_pr += consumed_amt_against_po
 
-				po_billed_amt_details[pr_item.purchase_order_item]["billed_amt"] = billed_amt_against_po
+				po_billed_amt_details[pr_item.purchase_order_item]["billed_amt"] = (
+					billed_amt_against_po - consumed_amt_against_po
+				)
+				po_billed_amt_details[pr_item.purchase_order_item]["billed_qty"] = billed_qty_against_po * (
+					1 - consumed_amt_against_po / billed_amt_against_po
+				)
 
 		if pr_item.billed_amt != billed_amt_against_pr:
 			# update existing doc if possible
@@ -1399,22 +1449,22 @@ def update_billing_percentage(pr_doc, update_modified=True, adjust_incoming_rate
 					billed_qty_amt_based_on_po[item.purchase_order_item]["amount"] -= billed_amt
 
 				if qty:
-					adjusted_amt = (
-						flt(billed_amt / qty) - (flt(item.rate) * flt(pr_doc.conversion_rate))
-					) * item.qty
+					adjusted_amt = flt(billed_amt / qty) * item.qty - flt(item.base_net_amount)
 
 			adjusted_amt = flt(adjusted_amt, item.precision("amount"))
 			pi_landed_cost_amount += adjusted_amt
 			item.db_set("amount_difference_with_purchase_invoice", adjusted_amt, update_modified=False)
 		elif amount and item.billed_amt > amount:
-			per_over_billed = (flt(item.billed_amt / amount, 2) * 100) - 100
+			per_over_billed = flt(item.billed_amt / amount * 100 - 100, 2)
 			if (
 				per_over_billed > over_billing_allowance
 				and role_allowed_to_over_bill not in frappe.get_roles()
 			):
 				frappe.throw(
 					_("Over Billing Allowance exceeded for Purchase Receipt Item {0} ({1}) by {2}%").format(
-						item.name, frappe.bold(item.item_code), per_over_billed - over_billing_allowance
+						item.name,
+						frappe.bold(item.item_code),
+						flt(per_over_billed - over_billing_allowance, 2),
 					)
 				)
 

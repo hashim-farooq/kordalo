@@ -13,6 +13,8 @@ from frappe.utils.html_utils import clean_html
 
 from kordalo.stock.utils import check_pending_reposting
 
+BOOT_FIELDS = ("disable_serial_no_and_batch_selector", "pick_serial_and_batch_based_on")
+
 
 class StockSettings(Document):
 	# begin: auto-generated types
@@ -107,6 +109,16 @@ class StockSettings(Document):
 		self.change_precision_for_stock_entry()
 		self.validate_do_not_use_batchwise_valuation()
 
+	def on_update(self):
+		self.clear_boot_cache()
+
+	def clear_boot_cache(self):
+		"""Boot sends `BOOT_FIELDS` in sysdefaults."""
+		if any(self.has_value_changed(field) for field in BOOT_FIELDS):
+			frappe.cache.delete_key("bootinfo")
+			# Requests before commit can cache the old boot again.
+			frappe.db.after_commit.add(lambda: frappe.cache.delete_key("bootinfo"))
+
 	def update_barcode_field_visibility(self):
 		if not self.has_value_changed("show_barcode_field"):
 			return
@@ -178,7 +190,7 @@ class StockSettings(Document):
 			# which does not have it's own valuation method
 			sle = frappe.db.sql(
 				"""select name from `tabStock Ledger Entry` sle
-				where exists(select name from tabItem
+				where sle.is_cancelled=0 and exists(select name from tabItem
 					where name=sle.item_code and (valuation_method is null or valuation_method='')) limit 1
 			"""
 			)
