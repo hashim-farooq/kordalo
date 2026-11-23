@@ -197,75 +197,6 @@ class TestStockReservationEntry(KordaloTestSuite):
 	@KordaloTestSuite.change_settings(
 		"Stock Settings", {"allow_negative_stock": 0, "enable_stock_reservation": 1}
 	)
-	def test_update_reserved_qty_in_voucher(self) -> None:
-		# Step - 1: Create a `Sales Order`
-		so = make_sales_order(
-			item_code=self.sr_item.name,
-			warehouse=self.warehouse,
-			qty=50,
-			rate=100,
-			do_not_submit=True,
-		)
-		so.reserve_stock = 0  # Stock Reservation Entries won't be created on submit
-		so.items[0].reserve_stock = 1
-		so.save()
-		so.submit()
-
-		# Step - 2: Create a `Stock Reservation Entry[1]` for the `Sales Order Item`
-		sre1 = make_stock_reservation_entry(
-			item_code=self.sr_item.name,
-			warehouse=self.warehouse,
-			voucher_type="Sales Order",
-			voucher_no=so.name,
-			voucher_detail_no=so.items[0].name,
-			reserved_qty=30,
-		)
-
-		so.load_from_db()
-		sre1.load_from_db()
-		self.assertEqual(sre1.status, "Partially Reserved")
-		self.assertEqual(so.items[0].stock_reserved_qty, sre1.reserved_qty)
-
-		# Step - 3: Create a `Stock Reservation Entry[2]` for the `Sales Order Item`
-		sre2 = make_stock_reservation_entry(
-			item_code=self.sr_item.name,
-			warehouse=self.warehouse,
-			voucher_type="Sales Order",
-			voucher_no=so.name,
-			voucher_detail_no=so.items[0].name,
-			reserved_qty=20,
-		)
-
-		so.load_from_db()
-		sre2.load_from_db()
-		self.assertEqual(sre1.status, "Partially Reserved")
-		self.assertEqual(so.items[0].stock_reserved_qty, sre1.reserved_qty + sre2.reserved_qty)
-
-		# Step - 4: Cancel `Stock Reservation Entry[1]`
-		sre1.cancel()
-		so.load_from_db()
-		sre1.load_from_db()
-		self.assertEqual(sre1.status, "Cancelled")
-		self.assertEqual(so.items[0].stock_reserved_qty, sre2.reserved_qty)
-
-		# Step - 5: Update `Stock Reservation Entry[2]` Reserved Qty
-		sre2.reserved_qty += sre1.reserved_qty
-		sre2.save()
-		so.load_from_db()
-		sre1.load_from_db()
-		self.assertEqual(sre2.status, "Reserved")
-		self.assertEqual(so.items[0].stock_reserved_qty, sre2.reserved_qty)
-
-		# Step - 6: Cancel `Stock Reservation Entry[2]`
-		sre2.cancel()
-		so.load_from_db()
-		sre2.load_from_db()
-		self.assertEqual(sre1.status, "Cancelled")
-		self.assertEqual(so.items[0].stock_reserved_qty, 0)
-
-	@KordaloTestSuite.change_settings(
-		"Stock Settings", {"allow_negative_stock": 0, "enable_stock_reservation": 1}
-	)
 	def test_cant_consume_reserved_stock(self) -> None:
 		from kordalo.stock.doctype.stock_reservation_entry.stock_reservation_entry import (
 			cancel_stock_reservation_entries,
@@ -455,6 +386,238 @@ class TestStockReservationEntry(KordaloTestSuite):
 
 				for sre_detail in sre_details:
 					self.assertEqual(sre_detail.reserved_qty, sre_detail.delivered_qty)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"enable_stock_reservation": 1, "allow_negative_stock": 0}
+	)
+	def test_closing_sales_order_with_reserved_stock_is_blocked(self) -> None:
+		so = make_sales_order(
+			item_code=self.sr_item.name, warehouse=self.warehouse, qty=10, rate=100, do_not_submit=True
+		)
+		so.reserve_stock = 1
+		so.items[0].reserve_stock = 1
+		so.save()
+		so.submit()
+		so.create_stock_reservation_entries()
+
+		# closing must not strand reserved stock; the user has to unreserve first
+		self.assertRaises(frappe.ValidationError, so.update_status, "Closed")
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"enable_stock_reservation": 1, "allow_negative_stock": 0}
+	)
+	def test_rate_only_update_items_keeps_reservation(self) -> None:
+		# A rate-only Update Items must not cancel and rebuild reservations, otherwise the
+		# partly delivered reservation is dropped when the Delivery Note is later cancelled.
+		from kordalo.controllers.accounts_controller import update_child_qty_rate
+
+		so = make_sales_order(
+			item_code=self.sr_item.name, warehouse=self.warehouse, qty=10, rate=100, do_not_submit=True
+		)
+		so.reserve_stock = 1
+		so.items[0].reserve_stock = 1
+		so.save()
+		so.submit()
+		so.create_stock_reservation_entries()
+
+		dn = make_delivery_note(so.name)
+		dn.items[0].qty = 4
+		dn.submit()
+
+		trans_items = [{"docname": so.items[0].name, "item_code": self.sr_item.name, "qty": 10, "rate": 150}]
+		update_child_qty_rate("Sales Order", frappe.as_json(trans_items), so.name)
+
+		dn.cancel()
+
+		sre = frappe.get_all(
+			"Stock Reservation Entry",
+			filters={"voucher_no": so.name, "docstatus": 1},
+			fields=["reserved_qty", "delivered_qty"],
+		)[0]
+		self.assertEqual(sre.reserved_qty, 10)
+		self.assertEqual(sre.delivered_qty, 0)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 0,
+		},
+	)
+	def test_reservation_of_a_fractional_stock_qty_delivers_what_the_ledger_posts(self) -> None:
+		from kordalo.stock.serial_batch_bundle import get_batches_from_bundle
+
+		so = self.make_fractionally_reserved_sales_order()
+		so.load_from_db()
+		self.assertFalse(so.has_unreserved_stock())
+
+		dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": 1})
+		dn.save()
+		dn.submit()
+
+		actual_qty = frappe.db.get_value(
+			"Stock Ledger Entry", {"voucher_no": dn.name, "is_cancelled": 0}, "actual_qty"
+		)
+		self.assertEqual(
+			sum(get_batches_from_bundle(dn.items[0].serial_and_batch_bundle).values()), actual_qty
+		)
+		self.assertEqual(self.get_reservation_status(so), "Delivered")
+
+		dn.cancel()
+		self.assertEqual(self.get_reservation_status(so), "Reserved")
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 0,
+		},
+	)
+	def test_reservation_of_a_fractional_stock_qty_across_batches_reserves_the_full_qty(self) -> None:
+		so = self.make_fractionally_reserved_sales_order(batch_qtys=(0.2, 0.2))
+		self.assertEqual(self.get_reservation_status(so), "Reserved")
+
+		dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": 1})
+		self.assertEqual(dn.items[0].qty, 1)
+		dn.submit()
+		self.assertEqual(self.get_reservation_status(so), "Delivered")
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 0,
+		},
+	)
+	def test_reservation_summed_with_float_noise_across_batches_is_reserved(self) -> None:
+		item = make_item(
+			properties={
+				"stock_uom": "Kg",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TSRN-.#####",
+			}
+		).name
+		for qty in (0.01, 0.01, 0.02, 1):
+			make_stock_entry(item_code=item, target=self.warehouse, qty=qty, basic_rate=100)
+		so = make_sales_order(item_code=item, warehouse=self.warehouse, qty=0.3, rate=100)
+		so.create_stock_reservation_entries()
+		self.assertEqual(self.get_reservation_status(so), "Reserved")
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"allow_partial_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 0,
+		},
+	)
+	def test_bundle_component_reserved_in_fractional_batch_qty_delivers_every_reservation(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+
+		component = make_item(
+			properties={
+				"stock_uom": "Kg",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TSRB-.#####",
+			}
+		).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component])
+		for _i in range(3):
+			make_stock_entry(item_code=component, target=self.warehouse, qty=0.34, basic_rate=100)
+
+		so = make_sales_order(item_code=bundle, warehouse=self.warehouse, qty=1)
+		# one batch each; the packed row's delivery makes one bundle for all three
+		for qty in (0.336, 0.336, 0.328):
+			so.create_stock_reservation_entries(
+				items_details=[
+					{
+						"sales_order_item": so.packed_items[0].name,
+						"item_code": component,
+						"warehouse": self.warehouse,
+						"qty_to_reserve": qty,
+					}
+				],
+				notify=False,
+			)
+
+		make_delivery_note(so.name, kwargs={"for_reserved_stock": 1}).submit()
+
+		self.assertEqual(
+			frappe.get_all(
+				"Stock Reservation Entry", {"voucher_no": so.name, "docstatus": 1}, pluck="status"
+			),
+			["Delivered"] * 3,
+		)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_cancelling_the_delivery_that_closed_a_fractional_reservation_reserves_its_qty_again(
+		self,
+	) -> None:
+		frappe.db.set_value("UOM", "Box", "must_be_whole_number", 0)
+		so = self.make_fractionally_reserved_sales_order()
+
+		first_dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": 1})
+		first_dn.items[0].qty = 0.3
+		first_dn.submit()
+		last_dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": 1})
+		last_dn.submit()
+		self.assertEqual(self.get_reservation_status(so), "Delivered")
+
+		last_dn.cancel()
+		delivered_qty = _get_stock_reservation_entries_for_voucher(
+			"Sales Order", so.name, so.items[0].name, fields=["delivered_qty"]
+		)[0].delivered_qty
+		first_dn_posted_qty = frappe.db.get_value(
+			"Stock Ledger Entry", {"voucher_no": first_dn.name, "is_cancelled": 0}, "actual_qty"
+		)
+		self.assertEqual(delivered_qty, abs(first_dn_posted_qty))
+
+	def make_fractionally_reserved_sales_order(self, batch_qtys=(1,)):
+		"""Reserve 1 Box of a batched item where 1 Box = 0.3333 Kg, with one batch per qty in ``batch_qtys``."""
+		item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Kg",
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "TSRF-.#####",
+				"uoms": [{"uom": "Box", "conversion_factor": 0.3333}],
+			}
+		).name
+		for qty in batch_qtys:
+			make_stock_entry(item_code=item, target=self.warehouse, qty=qty, basic_rate=100)
+		so = make_sales_order(item_code=item, warehouse=self.warehouse, qty=1, uom="Box", rate=100)
+		so.create_stock_reservation_entries()
+		return so
+
+	def get_reservation_status(self, so):
+		return _get_stock_reservation_entries_for_voucher(
+			"Sales Order", so.name, so.items[0].name, fields=["status"]
+		)[0].status
 
 	@KordaloTestSuite.change_settings(
 		"Stock Settings",
@@ -656,6 +819,400 @@ class TestStockReservationEntry(KordaloTestSuite):
 
 				# Test - 3: Reserved Serial/Batch Nos should be equal to Picked Serial/Batch Nos.
 				self.assertSetEqual(picked_sb_details, reserved_sb_details)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"allow_partial_reservation": 1,
+		},
+	)
+	def test_stock_reservation_from_pick_list_for_product_bundle(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		bundle, components = create_product_bundle(quantities=[2, 3], warehouse=self.warehouse)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse)
+
+		pl = create_pick_list(so.name)
+		pl.save()
+		pl.submit()
+		pl.create_stock_reservation_entries()
+		pl.reload()
+		so.reload()
+
+		packed_item_by_code = {row.item_code: row for row in so.packed_items}
+		self.assertEqual(len(pl.locations), len(components))
+
+		for location in pl.locations:
+			packed_item = packed_item_by_code[location.item_code]
+
+			# Test - 1: Bundle components should be reserved against their Packed Item.
+			sre_details = _get_stock_reservation_entries_for_voucher(
+				"Sales Order", so.name, packed_item.name, fields=["reserved_qty", "from_voucher_type"]
+			)
+			self.assertEqual(len(sre_details), 1)
+			self.assertEqual(sre_details[0].reserved_qty, packed_item.qty)
+			self.assertEqual(sre_details[0].from_voucher_type, "Pick List")
+
+			# Test - 2: Reserved Qty should be updated in Pick List Item.
+			self.assertEqual(location.stock_reserved_qty, location.picked_qty)
+
+		pl.cancel_stock_reservation_entries()
+		pl.reload()
+
+		# Test - 3: Unreserving from the Pick List should clear the reserved qty.
+		for location in pl.locations:
+			self.assertEqual(location.stock_reserved_qty, 0)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"enable_stock_reservation": 1, "allow_partial_reservation": 1}
+	)
+	def test_bundle_component_picked_from_two_warehouses_is_reserved(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		other_warehouse = "_Test Warehouse 1 - _TC"
+		bundle, components = create_product_bundle(quantities=[2], warehouse=self.warehouse)
+		make_stock_entry(item_code=components[0], target=other_warehouse, qty=10, rate=100)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse)
+
+		pl = create_pick_list(so.name)
+		location = pl.locations[0]
+		location.qty = location.stock_qty = location.picked_qty = 2
+		pl.append("locations", location.as_dict(no_default_fields=True)).warehouse = other_warehouse
+		pl.submit()
+		pl.create_stock_reservation_entries()
+
+		self.assertEqual(
+			get_sre_reserved_qty_details_for_voucher("Sales Order", so.name), {so.packed_items[0].name: 4}
+		)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings", {"allow_negative_stock": 0, "enable_stock_reservation": 1}
+	)
+	def test_update_items_keeps_pick_list_reservation_for_product_bundle(self) -> None:
+		from kordalo.controllers.accounts_controller import update_child_qty_rate
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		bundle, _components = create_product_bundle(quantities=[2, 3], warehouse=self.warehouse)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse)
+		pl = create_pick_list(so.name)
+		pl.save()
+		pl.submit()
+		pl.create_stock_reservation_entries()
+		so.reload()
+
+		row = so.items[0]
+		trans_items = [{"docname": row.name, "item_code": bundle, "qty": 1, "rate": row.rate, "idx": 1}]
+
+		# Packed Item reservations block reducing the bundle qty.
+		self.assertRaises(
+			frappe.ValidationError,
+			update_child_qty_rate,
+			"Sales Order",
+			frappe.as_json(trans_items),
+			so.name,
+		)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_delivery_consumes_bundle_component_reservation_from_other_warehouse(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		component_warehouse = "_Test Warehouse 1 - _TC"
+		bundle, components = create_product_bundle(quantities=[2], warehouse=self.warehouse)
+		make_stock_entry(item_code=components[0], target=component_warehouse, qty=10, rate=100)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse, do_not_submit=1)
+		so.reserve_stock = 1
+		so.packed_items[0].update({"warehouse": component_warehouse, "reserve_stock": 1})
+		so.submit()
+
+		dn = make_delivery_note(so.name)
+		dn.submit()
+
+		self.assertEqual(dn.packed_items[0].warehouse, component_warehouse)
+		self.assertEqual(
+			frappe.db.get_value(
+				"Stock Reservation Entry", {"voucher_detail_no": so.packed_items[0].name}, "delivered_qty"
+			),
+			4,
+		)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_return_keeps_warehouse_picked_for_reserved_bundle_component(self) -> None:
+		from kordalo.stock.doctype.delivery_note.delivery_note import make_sales_return
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		component_warehouse = "_Test Warehouse 1 - _TC"
+		bundle, components = create_product_bundle(quantities=[2], warehouse=self.warehouse)
+		make_stock_entry(item_code=components[0], target=component_warehouse, qty=10, rate=100)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse, do_not_submit=1)
+		so.reserve_stock = 1
+		so.packed_items[0].update({"warehouse": component_warehouse, "reserve_stock": 1})
+		so.submit()
+		dn = make_delivery_note(so.name)
+		dn.submit()
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.packed_items[0].warehouse = self.warehouse
+		return_dn.save()
+
+		self.assertEqual(return_dn.packed_items[0].warehouse, self.warehouse)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_delivery_consumes_bundle_component_picked_from_other_warehouse(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+		from kordalo.stock.doctype.pick_list.pick_list import create_delivery_note
+
+		other_warehouse = "_Test Warehouse 1 - _TC"
+		bundle, components = create_product_bundle(quantities=[2], warehouse=self.warehouse)
+		make_stock_entry(item_code=components[0], target=other_warehouse, qty=10, rate=100)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse)
+
+		pl = create_pick_list(so.name)
+		pl.pick_manually = 1
+		pl.locations[0].warehouse = other_warehouse
+		pl.locations[0].picked_qty = pl.locations[0].stock_qty
+		pl.submit()
+		pl.create_stock_reservation_entries()
+
+		dn = create_delivery_note(pl.name)
+		dn.save()
+		dn.submit()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Stock Reservation Entry",
+				{"voucher_detail_no": so.packed_items[0].name, "docstatus": 1},
+				["warehouse", "delivered_qty"],
+			),
+			(other_warehouse, 4),
+		)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_bundle_component_is_reserved_in_its_packed_row_warehouse(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		other_warehouse = "_Test Warehouse 1 - _TC"
+		bundle, components = create_product_bundle(quantities=[2], warehouse=self.warehouse)
+		make_stock_entry(item_code=components[0], target=other_warehouse, qty=10, rate=100)
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse)
+
+		# the Reserve dialog's Set Warehouse must not move a component out of its packed row's warehouse
+		packed_item = so.packed_items[0]
+		so.create_stock_reservation_entries(
+			items_details=[
+				{
+					"sales_order_item": packed_item.name,
+					"item_code": packed_item.item_code,
+					"warehouse": other_warehouse,
+					"qty_to_reserve": 4,
+				}
+			]
+		)
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Stock Reservation Entry",
+				{"voucher_detail_no": packed_item.name, "docstatus": 1},
+				"warehouse",
+			),
+			self.warehouse,
+		)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_second_delivery_of_serial_reserved_bundle_takes_undelivered_serials(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+
+		serial_item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"valuation_rate": 200,
+				"has_serial_no": 1,
+				"serial_no_series": "SRSI-.#####",
+			}
+		)
+		create_material_receipt({serial_item.name: serial_item}, self.warehouse, qty=2)
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [serial_item.name])
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": True})
+		dn.items[0].qty = 1
+		delivered_serial_no = dn.packed_items[0].serial_no.split("\n")[0]
+		dn.packed_items[0].serial_no = delivered_serial_no
+		dn.save()
+		dn.submit()
+
+		dn = make_delivery_note(so.name, kwargs={"for_reserved_stock": True})
+		self.assertNotIn(delivered_serial_no, dn.packed_items[0].serial_no.split("\n"))
+		dn.save()
+		dn.submit()
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_delivery_consumes_each_reservation_of_a_repeated_bundle_component(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+
+		component = make_item(properties={"is_stock_item": 1}).name
+		make_stock_entry(item_code=component, target=self.warehouse, qty=10, rate=100)
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [component, component], qty=2)
+		so = make_sales_order(item_code=bundle, qty=1, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		dn = make_delivery_note(so.name)
+		dn.submit()
+
+		for packed_item in so.packed_items:
+			self.assertEqual(
+				frappe.db.get_value(
+					"Stock Reservation Entry",
+					{"voucher_detail_no": packed_item.name, "docstatus": 1},
+					"status",
+				),
+				"Delivered",
+			)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"use_serial_batch_fields": 0,
+			"auto_create_serial_and_batch_bundle_for_outward": 1,
+		},
+	)
+	def test_delivery_consumes_batch_reservation_of_a_bundle_component(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+
+		batch_item = make_batch_item()
+		create_material_receipt({batch_item.name: batch_item}, self.warehouse, qty=5)
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [batch_item.name])
+		so = make_sales_order(item_code=bundle, qty=2, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		dn = make_delivery_note(so.name)
+		dn.submit()
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"Stock Reservation Entry",
+				{"voucher_detail_no": so.packed_items[0].name, "docstatus": 1},
+				"status",
+			),
+			"Delivered",
+		)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"allow_negative_stock": 0,
+			"enable_stock_reservation": 1,
+			"auto_reserve_serial_and_batch": 1,
+			"use_serial_batch_fields": 0,
+			"auto_create_serial_and_batch_bundle_for_outward": 1,
+			"pick_serial_and_batch_based_on": "FIFO",
+		},
+	)
+	@KordaloTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
+	def test_invoice_keeps_bundle_reservation_of_its_row_when_a_row_above_is_deleted(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+		from kordalo.selling.doctype.sales_order.sales_order import make_sales_invoice
+
+		batch_item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"valuation_rate": 300,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "SRBI-.#####.",
+			}
+		)
+		create_material_receipt({batch_item.name: batch_item}, self.warehouse, qty=2)
+		create_material_receipt({batch_item.name: batch_item}, self.warehouse, qty=2)
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [batch_item.name])
+		row = {"item_code": bundle, "warehouse": self.warehouse, "qty": 2, "rate": 100}
+		so = make_sales_order(item_list=[row, row], warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		si = make_sales_invoice(so.name)
+		si.update_stock = 1
+		si.remove(si.items[0])
+		si.submit()
+
+		for packed_item, status in zip(so.packed_items, ("Reserved", "Delivered"), strict=True):
+			self.assertEqual(
+				frappe.db.get_value(
+					"Stock Reservation Entry",
+					{"voucher_detail_no": packed_item.name, "docstatus": 1},
+					"status",
+				),
+				status,
+			)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_bundle_added_to_saved_sales_order_is_reserved(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		bundle, _components = create_product_bundle(warehouse=self.warehouse)
+		so = make_sales_order(item_code=self.sr_item.name, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+
+		so.append("items", {"item_code": bundle, "qty": 1, "rate": 100, "warehouse": self.warehouse})
+		so.save()
+
+		self.assertEqual([row.reserve_stock for row in so.packed_items], [1, 1])
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_pick_list_is_blocked_for_reserved_bundle_components(self) -> None:
+		from kordalo.stock.doctype.packed_item.test_packed_item import create_product_bundle
+
+		bundle, _components = create_product_bundle(warehouse=self.warehouse)
+		so = make_sales_order(item_code=bundle, qty=1, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		self.assertTrue(has_reserved_stock("Sales Order", so.name))
+		self.assertRaises(frappe.ValidationError, create_pick_list, so.name)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_non_stock_bundle_component_is_not_reserved(self) -> None:
+		from kordalo.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
+
+		non_stock_component = make_item(properties={"is_stock_item": 0}).name
+		bundle = make_item(properties={"is_stock_item": 0}).name
+		make_product_bundle(bundle, [self.sr_item.name, non_stock_component])
+		so = make_sales_order(item_code=bundle, qty=1, warehouse=self.warehouse, do_not_save=True)
+		so.reserve_stock = 1
+		so.insert()
+		so.submit()
+
+		self.assertEqual(
+			{row.item_code: row.reserve_stock for row in so.packed_items},
+			{self.sr_item.name: 1, non_stock_component: 0},
+		)
 
 	@KordaloTestSuite.change_settings(
 		"Stock Settings",
@@ -1093,6 +1650,77 @@ class TestStockReservationEntryValidation(KordaloTestSuite):
 		self.assertRaises(frappe.ValidationError, sales_invoice.insert)
 
 	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"enable_stock_reservation": 1,
+			"allow_negative_stock": 0,
+			"auto_reserve_serial_and_batch": 1,
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_stock_updating_invoice_delivers_the_reserved_serial(self):
+		from kordalo.selling.doctype.sales_order.sales_order import make_sales_invoice
+
+		item_code = make_item(properties={"is_stock_item": 1, "has_serial_no": 1}).name
+		make_stock_entry(
+			item_code=item_code,
+			target="_Test Warehouse - _TC",
+			qty=2,
+			basic_rate=100,
+			serial_no="\n".join(f"{item_code}-{i}" for i in range(2)),
+			use_serial_batch_fields=1,
+		)
+		sales_order = make_sales_order(item_code=item_code, warehouse="_Test Warehouse - _TC", qty=1)
+		sales_order.create_stock_reservation_entries(notify=False)
+		sre = frappe.get_doc("Stock Reservation Entry", {"voucher_no": sales_order.name, "docstatus": 1})
+
+		sales_invoice = make_sales_invoice(sales_order.name)
+		sales_invoice.update_stock = 1
+		sales_invoice.insert()
+		sales_invoice.submit()
+
+		self.assertEqual(sales_invoice.items[0].serial_no, sre.sb_entries[0].serial_no)
+		self.assertEqual(frappe.db.get_value("Stock Reservation Entry", sre.name, "status"), "Delivered")
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"enable_stock_reservation": 1,
+			"allow_negative_stock": 0,
+			"auto_reserve_serial_and_batch": 1,
+			"use_serial_batch_fields": 0,
+		},
+	)
+	def test_stock_updating_invoice_bundle_picks_the_reserved_serial(self):
+		from kordalo.selling.doctype.sales_order.sales_order import make_sales_invoice
+
+		item_code = make_item(properties={"is_stock_item": 1, "has_serial_no": 1}).name
+		make_stock_entry(
+			item_code=item_code,
+			target="_Test Warehouse - _TC",
+			qty=2,
+			basic_rate=100,
+			serial_no="\n".join(f"{item_code}-{i}" for i in range(2)),
+			use_serial_batch_fields=1,
+		)
+		sales_order = make_sales_order(item_code=item_code, warehouse="_Test Warehouse - _TC", qty=1)
+		sales_order.create_stock_reservation_entries(notify=False)
+		sre = frappe.get_doc("Stock Reservation Entry", {"voucher_no": sales_order.name, "docstatus": 1})
+
+		sales_invoice = make_sales_invoice(sales_order.name)
+		sales_invoice.update_stock = 1
+		sales_invoice.insert()
+		sales_invoice.submit()
+
+		bundle = frappe.db.get_value(
+			"Serial and Batch Bundle", {"voucher_no": sales_invoice.name, "docstatus": 1}, "name"
+		)
+		self.assertEqual(
+			frappe.get_all("Serial and Batch Entry", filters={"parent": bundle}, pluck="serial_no"),
+			[sre.sb_entries[0].serial_no],
+		)
+
+	@KordaloTestSuite.change_settings(
 		"Stock Settings", {"enable_stock_reservation": 1, "allow_negative_stock": 0}
 	)
 	def test_direct_entry_is_checked_against_its_voucher(self):
@@ -1278,6 +1906,48 @@ class TestStockReservationEntryValidation(KordaloTestSuite):
 
 		second_delivery = make_delivery_note(sales_order.name, kwargs={"for_reserved_stock": 1})
 		self.assertEqual(len(second_delivery.items[0].serial_no.split("\n")), 2)
+
+	@KordaloTestSuite.change_settings(
+		"Stock Settings",
+		{
+			"enable_stock_reservation": 1,
+			"allow_negative_stock": 0,
+			"auto_reserve_serial_and_batch": 1,
+			"use_serial_batch_fields": 1,
+		},
+	)
+	def test_returned_serial_from_partly_delivered_reservation_can_be_reserved_again(self):
+		from kordalo.stock.doctype.delivery_note.delivery_note import make_sales_return
+
+		item_code = make_item(properties={"is_stock_item": 1, "has_serial_no": 1}).name
+		make_stock_entry(
+			item_code=item_code,
+			target="_Test Warehouse - _TC",
+			qty=2,
+			basic_rate=100,
+			serial_no="\n".join(f"{item_code}-{i}" for i in range(2)),
+			use_serial_batch_fields=1,
+		)
+		sales_order = make_sales_order(item_code=item_code, warehouse="_Test Warehouse - _TC", qty=2)
+		sales_order.create_stock_reservation_entries(notify=False)
+
+		delivery = make_delivery_note(sales_order.name, kwargs={"for_reserved_stock": 1})
+		delivery.items[0].qty = 1
+		returned_serial_no = delivery.items[0].serial_no.split("\n")[0]
+		delivery.items[0].serial_no = returned_serial_no
+		delivery.submit()
+		make_sales_return(delivery.name).submit()
+
+		new_order = make_sales_order(item_code=item_code, warehouse="_Test Warehouse - _TC", qty=1)
+		new_order.create_stock_reservation_entries(notify=False)
+
+		sre_name = frappe.db.get_value(
+			"Stock Reservation Entry", {"voucher_no": new_order.name, "docstatus": 1}
+		)
+		reserved_serial_nos = frappe.get_all(
+			"Serial and Batch Entry", filters={"parent": sre_name}, pluck="serial_no"
+		)
+		self.assertEqual(reserved_serial_nos, [returned_serial_no])
 
 	@KordaloTestSuite.change_settings(
 		"Stock Settings",

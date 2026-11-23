@@ -13,6 +13,7 @@ from frappe.utils import flt, getdate
 from kordalo import get_company_currency
 from kordalo.controllers.accounts_controller import validate_conversion_rate
 from kordalo.manufacturing.doctype.blanket_order import blanket_order_pricing
+from kordalo.setup.doctype.terms_and_conditions.terms_and_conditions import validate_terms_and_conditions
 from kordalo.stock.doctype.item.item import get_item_defaults
 
 FULFILLED_QTY_FIELD = {"Sales Order": "delivered_qty", "Purchase Order": "received_qty"}
@@ -71,6 +72,9 @@ class BlanketOrder(Document):
 		blanket_order_pricing.set_price_list(self)
 
 	def validate(self):
+		validate_terms_and_conditions(
+			self.get("tc_name"), "selling" if self.blanket_order_type == "Selling" else "buying"
+		)
 		if not self.blanket_order_type:
 			return
 

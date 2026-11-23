@@ -231,7 +231,7 @@ kordalo.selling.POSInvoiceController = class POSInvoiceController extends kordal
 	}
 
 	async collect_outstanding_payment() {
-		const total_amount = flt(this.frm.doc.rounded_total) | flt(this.frm.doc.grand_total);
+		const total_amount = flt(this.frm.doc.rounded_total) || flt(this.frm.doc.grand_total);
 		const paid_amount = flt(this.frm.doc.paid_amount);
 		const outstanding_amount = flt(this.frm.doc.outstanding_amount);
 		const me = this;

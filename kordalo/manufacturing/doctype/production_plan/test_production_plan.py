@@ -1,5 +1,8 @@
 # Copyright (c) 2017, Frappe Technologies Pvt. Ltd. and Contributors
 # See license.txt
+import csv
+import io
+
 import frappe
 from frappe.utils import add_to_date, flt, getdate, now_datetime, nowdate
 
@@ -10,6 +13,9 @@ from kordalo.manufacturing.doctype.production_plan.production_plan import (
 	get_pooled_bin_details,
 	get_sales_orders,
 	get_warehouse_list,
+)
+from kordalo.manufacturing.doctype.production_plan.work_order_quantities import (
+	ProductionPlanWorkOrderQuantities,
 )
 from kordalo.manufacturing.doctype.work_order.work_order import OverProductionError
 from kordalo.manufacturing.doctype.work_order.work_order import make_stock_entry as make_se_from_wo
@@ -1482,6 +1488,104 @@ class TestProductionPlan(KordaloTestSuite):
 
 		self.assertEqual({row.get("item_code"): row.get("warehouse") for row in items}, warehouses)
 
+	def test_raw_materials_cover_finished_good_process_loss(self):
+		rm_item = make_item("_Test PP FG Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		fg_item = make_item("_Test PP FG Loss FG", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], process_loss_percentage=20, currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=80,
+			consider_process_loss=1,
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		items = get_items_for_material_requests(plan.as_dict())
+
+		self.assertEqual(
+			[(row.get("item_code"), row.get("required_bom_qty")) for row in items], [(rm_item, 100)]
+		)
+
+	def test_raw_materials_cover_sub_assembly_process_loss(self):
+		rm_item = make_item("_Test PP Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		sub_item = make_item("_Test PP Loss Sub", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		fg_item = make_item("_Test PP Loss FG", {"is_stock_item": 1}).name
+		make_bom(item=sub_item, raw_materials=[rm_item], process_loss_percentage=20, currency="INR")
+		make_bom(item=fg_item, raw_materials=[sub_item], currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=80,
+			consider_process_loss=1,
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		plan.po_items[0].include_exploded_items = 1
+		items = get_items_for_material_requests(plan.as_dict())
+
+		self.assertEqual(
+			[(row.get("item_code"), row.get("required_bom_qty")) for row in items], [(rm_item, 100)]
+		)
+
+	def test_plan_ignores_process_loss_unless_considered(self):
+		rm_item = make_item("_Test PP Ignored Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		sub_item = make_item("_Test PP Ignored Loss Sub", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		fg_item = make_item("_Test PP Ignored Loss FG", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		make_bom(item=sub_item, raw_materials=[rm_item], process_loss_percentage=20, currency="INR")
+		make_bom(item=fg_item, raw_materials=[sub_item], process_loss_percentage=20, currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item, planned_qty=80, stock_uom="Kg", skip_getting_mr_items=True, do_not_submit=1
+		)
+		plan.get_sub_assembly_items()
+		plan.save()
+
+		self.assertEqual(plan.po_items[0].process_loss_percentage, 0)
+		self.assertEqual(
+			(plan.sub_assembly_items[0].qty, plan.sub_assembly_items[0].process_loss_percentage), (80, 0)
+		)
+		plan.po_items[0].include_exploded_items = 1
+		items = get_items_for_material_requests(plan.as_dict())
+		self.assertEqual(
+			[(row.get("item_code"), row.get("required_bom_qty")) for row in items], [(rm_item, 80)]
+		)
+
+	def test_whole_number_sub_assembly_rounds_up_for_process_loss(self):
+		rm_item = make_item("_Test PP Whole Loss RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		sub_item = make_item("_Test PP Whole Loss Sub", {"is_stock_item": 1, "stock_uom": "Nos"}).name
+		fg_item = make_item("_Test PP Whole Loss FG", {"is_stock_item": 1}).name
+		make_bom(
+			item=sub_item, raw_materials=[rm_item], quantity=10, process_loss_percentage=10, currency="INR"
+		)
+		make_bom(item=fg_item, raw_materials=[sub_item], currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=10,
+			consider_process_loss=1,
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		plan.get_sub_assembly_items()
+
+		row = plan.sub_assembly_items[0]
+		order_qty = ProductionPlanWorkOrderQuantities.get_order_qty(row, "production_plan_sub_assembly_item")
+		self.assertEqual((row.qty, order_qty), (10, 12))
+
+	def test_whole_number_sub_assembly_rounds_up_without_process_loss(self):
+		rm_item = make_item("_Test PP Whole Ratio RM", {"is_stock_item": 1, "stock_uom": "Kg"}).name
+		sub_item = make_item("_Test PP Whole Ratio Sub", {"is_stock_item": 1, "stock_uom": "Nos"}).name
+		fg_item = make_item("_Test PP Whole Ratio FG", {"is_stock_item": 1}).name
+		make_bom(item=sub_item, raw_materials=[rm_item], currency="INR")
+		make_bom(item=fg_item, raw_materials=[sub_item], quantity=10, rm_qty=3, currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item, planned_qty=5, skip_getting_mr_items=True, do_not_submit=1
+		)
+		plan.get_sub_assembly_items()
+
+		self.assertEqual(plan.sub_assembly_items[0].qty, 2)
+
 	def test_transfer_type_raw_material_stays_in_stock_uom(self):
 		rm_item = make_item(
 			"_Test PP Transfer Box RM",
@@ -1531,6 +1635,274 @@ class TestProductionPlan(KordaloTestSuite):
 		row = get_items_for_material_requests(plan.as_dict())[0]
 
 		self.assertEqual((row.get("quantity"), row.get("uom"), row.get("conversion_factor")), (2, "Box", 10))
+
+	def test_purchase_uom_without_a_whole_stock_qty_is_requested_in_stock_uom(self):
+		frappe.db.set_value("UOM", "Box", "must_be_whole_number", 0)
+		frappe.db.set_value("UOM", "Nos", "must_be_whole_number", 1)
+		rm_item = make_item(
+			"_Test PP Fraction Box RM",
+			{
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"purchase_uom": "Box",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 12}],
+			},
+		).name
+		fg_item = make_item("_Test PP Fraction Box FG", {"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=13, currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=1,
+			for_warehouse="Stores - _TC",
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		row = get_items_for_material_requests(plan.as_dict())[0]
+
+		self.assertEqual((row.get("quantity"), row.get("uom"), row.get("conversion_factor")), (13, "Nos", 1))
+
+	def make_box_item(self):
+		"""A Material Transfer item stocked in Nos and bought in Boxes of 12 Nos."""
+		return make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"purchase_uom": "Box",
+				"default_material_request_type": "Material Transfer",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 12}],
+			},
+		).name
+
+	def make_plan_row_saved_with_purchase_uom(self, rm_item, qty=13):
+		"""A submitted plan whose row for `qty` Nos of `rm_item` is saved as `qty` Box at conversion factor 1."""
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=qty, currency="INR")
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=1,
+			warehouse="_Test Warehouse - _TC",
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		plan.for_warehouse = "Stores - _TC"
+		plan.set("mr_items", get_items_for_material_requests(plan.as_dict()))
+		plan.submit()
+		# rows saved before #60628 kept the stock qty under the purchase UOM
+		frappe.db.set_value(
+			"Material Request Plan Item", plan.mr_items[0].name, {"uom": "Box", "conversion_factor": 1}
+		)
+		return plan
+
+	def make_legacy_request_of_one_box(self, plan):
+		"""A submitted Material Request for 1 Box of the plan row, counted as the updater before #60628 did."""
+		row = plan.mr_items[0]
+		mr = frappe.new_doc("Material Request")
+		mr.update(
+			{
+				"material_request_type": "Material Transfer",
+				"company": plan.company,
+				"schedule_date": nowdate(),
+			}
+		)
+		mr.append(
+			"items",
+			{
+				"item_code": row.item_code,
+				"qty": 1,
+				"uom": "Box",
+				"schedule_date": nowdate(),
+				"warehouse": row.warehouse,
+				"production_plan": plan.name,
+				"material_request_plan_item": row.name,
+			},
+		)
+		mr.submit()
+		# the updater before #60628 counted the Material Request qty: 1 Box
+		frappe.db.set_value("Material Request Plan Item", row.name, "requested_qty", 1)
+		frappe.db.set_value("Production Plan", plan.name, "status", "Submitted")
+
+	def assert_patched_plan_requests_stock_uom(self, plan):
+		from kordalo.patches.v16_0.set_stock_uom_on_plan_rows_without_conversion import execute
+
+		execute()
+		plan.make_material_request()
+
+		requested = frappe.get_all(
+			"Material Request Item",
+			filters={"production_plan": plan.name},
+			fields=["qty", "uom", "stock_qty"],
+		)
+		self.assertEqual([(row.qty, row.uom, row.stock_qty) for row in requested], [(13, "Nos", 13)])
+
+	def test_patch_sets_stock_uom_on_plan_rows_saved_with_purchase_uom(self):
+		rm_item = self.make_box_item()
+
+		self.assert_patched_plan_requests_stock_uom(self.make_plan_row_saved_with_purchase_uom(rm_item))
+
+	def test_patch_sets_stock_uom_on_plan_rows_of_a_variant_with_the_template_uom(self):
+		template = make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"has_variants": 1,
+				"attributes": [{"attribute": "Test Size"}],
+				"default_material_request_type": "Material Transfer",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 12}],
+			},
+		).name
+		variant = create_variant(template, {"Test Size": "Large"})
+		variant.insert()
+
+		self.assert_patched_plan_requests_stock_uom(self.make_plan_row_saved_with_purchase_uom(variant.name))
+
+	def test_patch_rebuilds_requested_qty_of_plan_rows_saved_with_purchase_uom(self):
+		from kordalo.patches.v16_0.set_stock_uom_on_plan_rows_without_conversion import execute
+
+		plan = self.make_plan_row_saved_with_purchase_uom(self.make_box_item())
+		self.make_legacy_request_of_one_box(plan)
+
+		execute()
+
+		self.assertEqual(
+			frappe.db.get_value("Material Request Plan Item", plan.mr_items[0].name, "requested_qty"), 12
+		)
+
+	def test_patch_marks_a_plan_requested_in_full_as_material_requested(self):
+		from kordalo.patches.v16_0.set_stock_uom_on_plan_rows_without_conversion import execute
+
+		plan = self.make_plan_row_saved_with_purchase_uom(self.make_box_item(), qty=12)
+		self.make_legacy_request_of_one_box(plan)
+
+		execute()
+
+		self.assertEqual(frappe.db.get_value("Production Plan", plan.name, "status"), "Material Requested")
+
+	def test_download_raw_materials_shows_uom_of_required_qty(self):
+		rm_item = make_item(
+			"_Test PP Download Box RM",
+			{
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"purchase_uom": "Box",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 10}],
+			},
+		).name
+		fg_item = make_item("_Test PP Download Box FG", {"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=1, currency="INR")
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=50,
+			for_warehouse="Stores - _TC",
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		header, row = download_raw_material_rows(plan)[:2]
+
+		self.assertEqual((row[header.index("Required Qty")], row[header.index("UOM")]), ("5", "Box"))
+
+	def test_download_raw_materials_merges_transfer_and_purchase_in_one_uom(self):
+		rm_item = make_item(
+			"_Test PP Download Merge RM",
+			{
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"purchase_uom": "Box",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 10}],
+			},
+		).name
+		fg_item = make_item("_Test PP Download Merge FG", {"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=1, currency="INR")
+		make_stock_entry(item_code=rm_item, target="Finished Goods - _TC", qty=20, rate=100)
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=50,
+			for_warehouse="Stores - _TC",
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		# 20 Nos transferred from Finished Goods and 3 Box purchased
+		header, row = download_raw_material_rows(plan, warehouses=[{"warehouse": "Finished Goods - _TC"}])[:2]
+
+		self.assertEqual((flt(row[header.index("Required Qty")]), row[header.index("UOM")]), (50, "Nos"))
+		self.assertEqual(flt(row[header.index("Required Qty as per BOM")]), 50)
+
+	def test_transfer_is_taken_off_the_shortage_before_rounding_to_purchase_uom(self):
+		rm_item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"stock_uom": "Nos",
+				"purchase_uom": "Box",
+				"uoms": [{"uom": "Nos", "conversion_factor": 1}, {"uom": "Box", "conversion_factor": 10}],
+			}
+		).name
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=1, currency="INR")
+		make_stock_entry(item_code=rm_item, target="Stores - _TC", qty=3, rate=100)
+		make_stock_entry(item_code=rm_item, target="Finished Goods - _TC", qty=7, rate=100)
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=50,
+			for_warehouse="Stores - _TC",
+			ignore_existing_ordered_qty=1,
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		items = get_items_for_material_requests(
+			plan.as_dict(), warehouses=[{"warehouse": "Finished Goods - _TC"}]
+		)
+
+		# 47 short: 7 transferred, 40 Nos (4 Box) purchased
+		self.assertEqual(
+			[(d["material_request_type"], d["quantity"], d["uom"]) for d in items],
+			[("Material Transfer", 7, "Nos"), ("Purchase", 4, "Box")],
+		)
+
+	def test_transfer_rounds_up_to_a_whole_stock_uom(self):
+		rm_item = make_item(properties={"is_stock_item": 1, "stock_uom": "Nos"}).name
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=1, quantity=3, currency="INR")
+		make_stock_entry(item_code=rm_item, target="Finished Goods - _TC", qty=10, rate=100)
+
+		plan = create_production_plan(
+			item_code=fg_item,
+			planned_qty=5,
+			for_warehouse="Stores - _TC",
+			ignore_existing_ordered_qty=1,
+			skip_getting_mr_items=True,
+			do_not_submit=1,
+		)
+		items = get_items_for_material_requests(
+			plan.as_dict(), warehouses=[{"warehouse": "Finished Goods - _TC"}]
+		)
+
+		# 5 / 3 = 1.667 Nos short, rounded up to 2
+		self.assertEqual(
+			[(d["material_request_type"], d["quantity"], d["uom"]) for d in items],
+			[("Material Transfer", 2, "Nos")],
+		)
+
+	def test_download_raw_materials_puts_other_warehouse_qty_under_its_columns(self):
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=1, currency="INR")
+		make_stock_entry(item_code=rm_item, target="Finished Goods - _TC", qty=7, rate=100)
+		frappe.db.set_value(
+			"Bin", {"item_code": rm_item, "warehouse": "Finished Goods - _TC"}, "planned_qty", 4
+		)
+
+		plan = create_production_plan(
+			item_code=fg_item, planned_qty=50, skip_getting_mr_items=True, do_not_submit=1
+		)
+		header, item_row, warehouse_row = download_raw_material_rows(plan)[:3]
+
+		self.assertEqual(flt(item_row[header.index("Planned Qty")]), 4)
+		self.assertEqual(warehouse_row[header.index("Warehouse")], "Finished Goods - _TC")
+		self.assertEqual(flt(warehouse_row[header.index("Available Qty In Hand")]), 7)
+		self.assertEqual(flt(warehouse_row[header.index("Planned Qty")]), 4)
 
 	def test_requested_sub_assembly_components_are_not_requested(self):
 		for item in (
@@ -2093,6 +2465,23 @@ class TestProductionPlan(KordaloTestSuite):
 		self.assertEqual(to_produce_qty, 18.0)
 		pln.cancel()
 		frappe.delete_doc("Production Plan", pln.name)
+
+	def test_sub_assembly_bom_must_produce_its_item(self):
+		for item_code in ["PP SA BOM FG", "PP SA BOM SA", "PP SA BOM RM", "PP SA BOM Other"]:
+			create_item(item_code, is_stock_item=1)
+
+		make_bom(item="PP SA BOM SA", raw_materials=["PP SA BOM RM"])
+		fg_bom = make_bom(item="PP SA BOM FG", raw_materials=["PP SA BOM SA"])
+		other_bom = make_bom(item="PP SA BOM Other", raw_materials=["PP SA BOM SA"])
+
+		pln = frappe.new_doc("Production Plan")
+		pln.company = "_Test Company"
+		pln.sub_assembly_warehouse = "_Test Warehouse - _TC"
+		pln.append("po_items", {"item_code": "PP SA BOM FG", "bom_no": fg_bom.name, "planned_qty": 1})
+		pln.get_sub_assembly_items("In House")
+		pln.sub_assembly_items[0].bom_no = other_bom.name
+
+		self.assertRaisesRegex(frappe.ValidationError, "does not belong to Item", pln.save)
 
 	def test_get_warehouse_list_group(self):
 		"Check if required child warehouses are returned."
@@ -3058,6 +3447,61 @@ class TestProductionPlan(KordaloTestSuite):
 		reserved_qty_after_mr = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
 		self.assertEqual(reserved_qty_after_mr, before_qty)
 
+	def test_reserved_qty_for_production_plan_with_partial_stock(self):
+		from kordalo.stock.utils import get_or_make_bin
+
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], source_warehouse="_Test Warehouse - _TC")
+
+		make_stock_entry(item_code=rm_item, qty=4, rate=100, target="_Test Warehouse - _TC")
+
+		bin_name = get_or_make_bin(rm_item, "_Test Warehouse - _TC")
+		before_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+
+		pln = create_production_plan(item_code=fg_item, planned_qty=10, ignore_existing_ordered_qty=1)
+
+		row = next(d for d in pln.mr_items if d.item_code == rm_item)
+		self.assertEqual(row.required_bom_qty, 10)
+		self.assertEqual(row.quantity, 6)
+
+		after_qty = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_qty - before_qty, 10)
+
+		pln.reload()
+		pln.cancel()
+
+		after_cancel = flt(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"))
+		self.assertEqual(after_cancel, before_qty)
+
+	def test_reserved_qty_for_production_plan_with_split_raw_material(self):
+		from kordalo.stock.utils import get_or_make_bin
+
+		fg_item = make_item(properties={"is_stock_item": 1}).name
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=fg_item, raw_materials=[rm_item], rm_qty=10, source_warehouse="_Test Warehouse - _TC")
+		make_stock_entry(item_code=rm_item, qty=6, rate=100, target="_Test Warehouse 1 - _TC")
+
+		pln = create_production_plan(
+			item_code=fg_item,
+			for_warehouse="_Test Warehouse - _TC",
+			ignore_existing_ordered_qty=1,
+			skip_getting_mr_items=1,
+			do_not_save=1,
+		)
+		items = get_items_for_material_requests(
+			pln.as_dict(), warehouses=[{"warehouse": "_Test Warehouse 1 - _TC"}]
+		)
+		self.assertEqual([row["material_request_type"] for row in items], ["Material Transfer", "Purchase"])
+		self.assertEqual([row["required_bom_qty"] for row in items], [6, 4])
+
+		pln.extend("mr_items", items)
+		pln.insert()
+		pln.submit()
+
+		bin_name = get_or_make_bin(rm_item, "_Test Warehouse - _TC")
+		self.assertEqual(frappe.db.get_value("Bin", bin_name, "reserved_qty_for_production_plan"), 10)
+
 	def test_from_warehouse_for_purchase_material_request(self):
 		from kordalo.stock.doctype.warehouse.test_warehouse import create_warehouse
 		from kordalo.stock.utils import get_or_make_bin
@@ -3236,6 +3680,88 @@ class TestProductionPlan(KordaloTestSuite):
 		)
 		self.assertRaises(InvalidWarehouseCompany, plan.save)
 
+	def test_row_warehouse_of_another_company_is_rejected(self):
+		data = self._setup_group_rm_warehouse()
+		other_company_warehouse = "_Test Warehouse 2 - _TC1"
+		plan = create_production_plan(
+			item_code=data.fg_item,
+			planned_qty=10,
+			warehouse="_Test Warehouse - _TC",
+			do_not_save=1,
+			skip_getting_mr_items=1,
+		)
+		plan.append(
+			"mr_items",
+			{"item_code": data.rm_item, "warehouse": other_company_warehouse, "quantity": 7},
+		)
+		self.assertRaises(InvalidWarehouseCompany, plan.save)
+
+		plan.set("mr_items", [])
+		plan.append(
+			"sub_assembly_items",
+			{
+				"production_item": data.rm_item,
+				"fg_warehouse": other_company_warehouse,
+				"type_of_manufacturing": "In House",
+				"qty": 5,
+			},
+		)
+		self.assertRaises(InvalidWarehouseCompany, plan.save)
+
+		plan.set("sub_assembly_items", [])
+		plan.po_items[0].warehouse = other_company_warehouse
+		self.assertRaises(InvalidWarehouseCompany, plan.save)
+
+		plan.po_items[0].warehouse = "_Test Warehouse - _TC"
+		for fieldname in ("for_warehouse", "sub_assembly_warehouse"):
+			plan.set(fieldname, other_company_warehouse)
+			self.assertRaises(InvalidWarehouseCompany, plan.save)
+			plan.set(fieldname, None)
+
+		plan.append(
+			"mr_items",
+			{
+				"item_code": data.rm_item,
+				"warehouse": "_Test Warehouse - _TC",
+				"from_warehouse": other_company_warehouse,
+				"material_request_type": "Material Transfer",
+				"quantity": 7,
+			},
+		)
+		self.assertRaises(InvalidWarehouseCompany, plan.save)
+
+	def test_row_warehouse_of_plan_company_reserves_bin_on_submit(self):
+		data = self._setup_group_rm_warehouse()
+		warehouse = "_Test Warehouse - _TC"
+		plan = create_production_plan(
+			item_code=data.fg_item,
+			planned_qty=10,
+			warehouse=warehouse,
+			do_not_save=1,
+			skip_getting_mr_items=1,
+		)
+		plan.append(
+			"mr_items",
+			{"item_code": data.rm_item, "warehouse": warehouse, "quantity": 7, "required_bom_qty": 7},
+		)
+
+		def reserved_qty():
+			return flt(
+				frappe.db.get_value(
+					"Bin",
+					{"item_code": data.rm_item, "warehouse": warehouse},
+					"reserved_qty_for_production_plan",
+				)
+			)
+
+		reserved_before = reserved_qty()
+		plan.insert()
+		plan.submit()
+		self.assertEqual(reserved_qty() - reserved_before, 7)
+
+		plan.cancel()
+		self.assertEqual(reserved_qty(), reserved_before)
+
 	def test_for_warehouse_required_with_group_when_getting_raw_materials(self):
 		"A group warehouse without a For Warehouse is rejected when raw materials are fetched."
 		data = self._setup_group_rm_warehouse()
@@ -3368,7 +3894,7 @@ class TestProductionPlan(KordaloTestSuite):
 		self.assertEqual([row["quantity"] for row in items], [117, 133, 1000])
 		self.assertEqual(items[0]["from_warehouse"], source_warehouse)
 		self.assertEqual([row["warehouse"] for row in items], [pln.for_warehouse] * 3)
-		self.assertEqual([row["required_bom_qty"] for row in items], [250, 250, 1000])
+		self.assertEqual([row["required_bom_qty"] for row in items], [117, 133, 1000])
 		self.assertEqual(
 			[row["sales_order"] for row in items],
 			[pln.po_items[0].sales_order] * 2 + [pln.po_items[1].sales_order],
@@ -3997,8 +4523,12 @@ class TestProductionPlan(KordaloTestSuite):
 		pln.consider_minimum_order_qty = 1
 		mr_items = get_items_for_material_requests(pln.as_dict())
 
-		self.assertEqual(mr_items[0].get("quantity"), 110.232)
-		self.assertGreaterEqual(mr_items[0].get("quantity") * conversion_factor, 50000)
+		row = mr_items[0]
+		stock_uom = frappe.db.get_value("Item", rm_item, "stock_uom")
+		self.assertEqual(
+			(row.get("quantity"), row.get("uom"), row.get("conversion_factor")), (50000, stock_uom, 1)
+		)
+		self.assertGreaterEqual(row.get("quantity") * row.get("conversion_factor"), 50000)
 
 	def test_min_order_qty_grid_ceiling_from_other_locations(self):
 		from kordalo.stock.doctype.warehouse.test_warehouse import create_warehouse
@@ -4030,7 +4560,12 @@ class TestProductionPlan(KordaloTestSuite):
 
 		rows_by_type = {d.get("material_request_type"): d for d in mr_items}
 		self.assertEqual(rows_by_type["Material Transfer"].get("quantity"), 4)
-		self.assertEqual(rows_by_type["Purchase"].get("quantity"), 110.232)
+		purchase_row = rows_by_type["Purchase"]
+		stock_uom = frappe.db.get_value("Item", rm_item, "stock_uom")
+		self.assertEqual(
+			(purchase_row.get("quantity"), purchase_row.get("uom"), purchase_row.get("conversion_factor")),
+			(50000, stock_uom, 1),
+		)
 
 	def test_min_order_qty_round_trip_to_purchase_order(self):
 		from kordalo.stock.doctype.material_request.material_request import (
@@ -4088,16 +4623,21 @@ class TestProductionPlan(KordaloTestSuite):
 		fg_item = make_item(properties={"is_stock_item": 1}).name
 		rm_item = make_item(properties={"is_stock_item": 1}).name
 
+		other_fg_item = make_item(properties={"is_stock_item": 1}).name
+
 		make_bom(item=fg_item, raw_materials=[rm_item], source_warehouse="_Test Warehouse - _TC")
+		other_bom = make_bom(
+			item=other_fg_item, raw_materials=[rm_item], source_warehouse="_Test Warehouse - _TC"
+		)
 
 		pln = create_production_plan(item_code=fg_item, planned_qty=10, do_not_submit=1)
 
 		pln.append(
 			"po_items",
 			{
-				"item_code": rm_item,
+				"item_code": other_fg_item,
 				"planned_qty": 20,
-				"bom_no": pln.po_items[0].bom_no,
+				"bom_no": other_bom.name,
 				"warehouse": pln.po_items[0].warehouse,
 				"planned_start_date": add_to_date(nowdate(), days=1),
 			},
@@ -4221,6 +4761,39 @@ class TestProductionPlan(KordaloTestSuite):
 
 		shared_rows = [row for row in pln.sub_assembly_items if row.production_item == shared_item]
 		self.assertEqual([row.qty for row in shared_rows], [0, 50])
+
+	def test_remaining_sub_assembly_stock_consumed_across_finished_goods(self):
+		rm_item = make_item(properties={"is_stock_item": 1}).name
+		shared_item = make_item(properties={"is_stock_item": 1}).name
+		fg_a = make_item(properties={"is_stock_item": 1}).name
+		fg_b = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=shared_item, raw_materials=[rm_item])
+		make_bom(item=fg_a, raw_materials=[shared_item])
+		make_bom(item=fg_b, raw_materials=[shared_item])
+		make_stock_entry(item_code=shared_item, qty=6, target="_Test Warehouse - _TC", rate=100)
+
+		pln = create_production_plan(
+			item_code=fg_a,
+			planned_qty=5,
+			warehouse="_Test Warehouse - _TC",
+			sub_assembly_warehouse="_Test Warehouse - _TC",
+			skip_available_sub_assembly_item=1,
+			do_not_save=1,
+			skip_getting_mr_items=1,
+		)
+		pln.append(
+			"po_items",
+			{
+				"item_code": fg_b,
+				"bom_no": frappe.db.get_value("Item", fg_b, "default_bom"),
+				"planned_qty": 10,
+				"stock_uom": "Nos",
+				"warehouse": "_Test Warehouse - _TC",
+			},
+		)
+		pln.get_sub_assembly_items()
+
+		self.assertEqual([row.qty for row in pln.sub_assembly_items], [0, 9])
 
 	def test_calculation_of_sub_assembly_items(self):
 		make_item("Sub Assembly Item ", properties={"is_stock_item": 1})
@@ -4374,6 +4947,45 @@ class TestProductionPlan(KordaloTestSuite):
 			frappe.db.exists("Stock Reservation Entry", {"voucher_no": plan.name, "docstatus": 1})
 		)
 
+	def test_only_submitted_plan_can_be_closed_or_reopened(self):
+		finished_good = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=finished_good, raw_materials=[make_item(properties={"is_stock_item": 1}).name])
+
+		draft_plan = create_production_plan(
+			item_code=finished_good, planned_qty=3, skip_getting_mr_items=1, do_not_submit=1
+		)
+		self.assertRaises(frappe.ValidationError, draft_plan.set_status, close=True)
+		self.assertEqual(frappe.db.get_value("Production Plan", draft_plan.name, "status"), "Draft")
+
+		draft_plan.docstatus = 1
+		self.assertRaises(frappe.ValidationError, draft_plan.set_status, close=True)
+		self.assertEqual(frappe.db.get_value("Production Plan", draft_plan.name, "status"), "Draft")
+
+		cancelled_plan = create_production_plan(
+			item_code=finished_good, planned_qty=3, skip_getting_mr_items=1
+		)
+		cancelled_plan.cancel()
+		self.assertRaises(frappe.ValidationError, cancelled_plan.set_status, close=True)
+		self.assertRaises(frappe.ValidationError, cancelled_plan.set_status, close=False)
+		self.assertEqual(frappe.db.get_value("Production Plan", cancelled_plan.name, "status"), "Cancelled")
+
+	def test_submitted_plan_can_be_closed_and_reopened(self):
+		finished_good = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=finished_good, raw_materials=[make_item(properties={"is_stock_item": 1}).name])
+		plan = create_production_plan(item_code=finished_good, planned_qty=3, skip_getting_mr_items=1)
+
+		plan.set_status(close=True, update_bin=True)
+		self.assertEqual(frappe.db.get_value("Production Plan", plan.name, "status"), "Closed")
+
+		plan.reload()
+		plan.set_status(close=False, update_bin=True)
+		self.assertEqual(frappe.db.get_value("Production Plan", plan.name, "status"), "Submitted")
+
+		plan.docstatus = 2
+		plan.set_status(close=False, update_bin=True)
+		self.assertEqual(frappe.db.get_value("Production Plan", plan.name, "status"), "Submitted")
+		self.assertEqual(frappe.db.get_value("Production Plan", plan.name, "docstatus"), 1)
+
 	def test_stock_reservation_against_production_plan(self):
 		from kordalo.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
 		from kordalo.manufacturing.doctype.bom.test_bom import create_nested_bom
@@ -4486,6 +5098,148 @@ class TestProductionPlan(KordaloTestSuite):
 		reserved_entries = sre.get_reserved_entries("Production Plan", plan.name)
 		self.assertTrue(len(reserved_entries) == 0)
 		frappe.db.set_single_value("Stock Settings", "enable_stock_reservation", 0)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	@KordaloTestSuite.change_settings("Buying Settings", {"over_order_allowance": 200})
+	def test_purchase_receipt_reserves_only_the_plan_shortfall(self):
+		self.assertEqual(self.receive_more_than_plan_shortfall("RM For SR Shortfall"), 10)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	@KordaloTestSuite.change_settings("Buying Settings", {"over_order_allowance": 200})
+	def test_purchase_receipt_reserves_only_the_plan_shortfall_of_batches(self):
+		make_item(
+			"Batch RM For SR Shortfall",
+			{"has_batch_no": 1, "create_new_batch": 1, "batch_number_series": "BRMSRS-.#####"},
+		)
+		self.assertEqual(self.receive_more_than_plan_shortfall("Batch RM For SR Shortfall"), 10)
+
+	def receive_more_than_plan_shortfall(self, rm_item):
+		from kordalo.manufacturing.doctype.bom.test_bom import create_nested_bom
+
+		parent_bom = create_nested_bom({f"FG For {rm_item}": {rm_item: {}}}, prefix="")
+		warehouse = "_Test Warehouse - _TC"
+		make_stock_entry(item_code=rm_item, target=warehouse, qty=4, basic_rate=100)
+
+		plan = create_production_plan(
+			item_code=parent_bom.item,
+			planned_qty=10,
+			ignore_existing_ordered_qty=1,
+			do_not_submit=1,
+			warehouse=warehouse,
+			for_warehouse=warehouse,
+			reserve_stock=1,
+		)
+		plan.set("mr_items", [])
+		for d in get_items_for_material_requests(plan.as_dict()):
+			plan.append("mr_items", d)
+		plan.save()
+		plan.submit()
+		return self.receive_more_than_plan_needs(plan)
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	@KordaloTestSuite.change_settings("Buying Settings", {"over_order_allowance": 200})
+	def test_purchase_receipt_ignores_sub_assembly_reservations_of_the_same_item(self):
+		from kordalo.manufacturing.doctype.bom.test_bom import create_nested_bom
+
+		sub_assembly_item = "Sub Assembly For SR Shortfall"
+		parent_bom = create_nested_bom(
+			{
+				"FG For SR Shortfall Sub Assembly": {
+					sub_assembly_item: {"RM For SR Shortfall Sub Assembly": {}}
+				}
+			},
+			prefix="",
+		)
+		warehouse = "_Test Warehouse - _TC"
+		make_stock_entry(item_code=sub_assembly_item, target=warehouse, qty=4, basic_rate=100)
+
+		plan = create_production_plan(
+			item_code=parent_bom.item,
+			planned_qty=10,
+			ignore_existing_ordered_qty=1,
+			skip_getting_mr_items=1,
+			do_not_submit=1,
+			warehouse=warehouse,
+			for_warehouse=warehouse,
+			sub_assembly_warehouse=warehouse,
+			reserve_stock=1,
+		)
+		plan.get_sub_assembly_items()
+		plan.append(
+			"mr_items",
+			{
+				"item_code": sub_assembly_item,
+				"warehouse": warehouse,
+				"quantity": 10,
+				"required_bom_qty": 10,
+				"material_request_type": "Purchase",
+				"uom": frappe.db.get_value("Item", sub_assembly_item, "stock_uom"),
+				"conversion_factor": 1,
+			},
+		)
+		plan.save()
+		plan.submit()
+
+		self.assertEqual(self.receive_more_than_plan_needs(plan), 14)
+
+	def receive_more_than_plan_needs(self, plan):
+		from kordalo.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
+		from kordalo.stock.doctype.material_request.material_request import make_purchase_order
+
+		plan.submit_material_request = 1
+		plan.make_material_request()
+
+		mr_name = frappe.db.get_value("Material Request", {"production_plan": plan.name})
+		po = make_purchase_order(mr_name)
+		po.supplier = "_Test Supplier"
+		po.items[0].qty = 15
+		po.submit()
+		make_purchase_receipt(po.name).submit()
+
+		reserved_entries = StockReservation(plan).get_reserved_entries("Production Plan", plan.name)
+		return sum({row.name: row.reserved_qty for row in reserved_entries}.values())
+
+	@KordaloTestSuite.change_settings("Stock Settings", {"enable_stock_reservation": 1})
+	def test_hand_off_releases_the_plan_row(self):
+		warehouse = "_Test Warehouse - _TC"
+		raw_material = make_item(properties={"is_stock_item": 1}).name
+		finished_good = make_item(properties={"is_stock_item": 1}).name
+		make_bom(item=finished_good, raw_materials=[raw_material], rm_qty=1)
+		make_stock_entry(item_code=raw_material, target=warehouse, qty=10, basic_rate=100)
+
+		plan = create_production_plan(
+			item_code=finished_good,
+			planned_qty=10,
+			ignore_existing_ordered_qty=1,
+			do_not_submit=1,
+			warehouse=warehouse,
+			for_warehouse=warehouse,
+			reserve_stock=1,
+		)
+		plan.set("mr_items", [])
+		for row in get_items_for_material_requests(plan.as_dict()):
+			plan.append("mr_items", row)
+		plan.submit()
+
+		plan.make_work_order()
+		work_order = frappe.get_doc("Work Order", {"production_plan": plan.name})
+		work_order.source_warehouse = work_order.wip_warehouse = warehouse
+		work_order.fg_warehouse = warehouse
+		work_order.submit()
+
+		self.assertEqual(
+			frappe.db.get_value("Material Request Plan Item", plan.mr_items[0].name, "stock_reserved_qty"), 0
+		)
+		self.assertEqual(
+			set(
+				frappe.get_all(
+					"Stock Reservation Entry",
+					filters={"voucher_type": "Production Plan", "voucher_no": plan.name, "docstatus": 1},
+					pluck="status",
+				)
+			),
+			{"Closed"},
+		)
 
 	def test_no_stock_reservation_via_purchase_receipt_when_reserve_stock_disabled(self):
 		from kordalo.buying.doctype.purchase_order.purchase_order import make_purchase_receipt
@@ -5140,6 +5894,81 @@ class TestProductionPlan(KordaloTestSuite):
 		self.assertGreater(requested_qty, 0)
 		self.assertEqual(pln.status, "Material Requested")
 
+	def test_sales_order_query_follows_company_user_permission(self):
+		from kordalo.manufacturing.doctype.production_plan.production_plan import sales_order_query
+
+		item = make_item(properties={"is_stock_item": 1}).name
+		sales_order = make_sales_order(item_code=item, qty=5, rate=100).name
+		other_company_planner = create_manufacturing_user("planner-tc1@example.com", "_Test Company 1")
+		same_company_planner = create_manufacturing_user("planner-tc@example.com", "_Test Company")
+
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(other_company_planner)
+		self.assertFalse(sales_order_query(filters={"item_code": item}))
+		self.assertFalse(sales_order_query(filters={"company": "_Test Company", "item_code": item}))
+
+		frappe.set_user(same_company_planner)
+		rows = sales_order_query(filters={"company": "_Test Company", "item_code": item})
+		self.assertEqual([row[0] for row in rows], [sales_order])
+
+	def test_sales_order_query_without_user_permission_lists_all_open_orders(self):
+		from kordalo.manufacturing.doctype.production_plan.production_plan import sales_order_query
+
+		item = make_item(properties={"is_stock_item": 1}).name
+		sales_order = make_sales_order(item_code=item, qty=5, rate=100).name
+		planner = create_manufacturing_user("planner-unrestricted@example.com")
+
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(planner)
+		self.assertEqual([row[0] for row in sales_order_query(filters={"item_code": item})], [sales_order])
+
+	def test_sales_order_query_follows_item_user_permission_on_order_rows(self):
+		from kordalo.manufacturing.doctype.production_plan.production_plan import (
+			get_so_details,
+			sales_order_query,
+		)
+
+		allowed_item = make_item(properties={"is_stock_item": 1}).name
+		other_item = make_item(properties={"is_stock_item": 1}).name
+		allowed_order = make_sales_order(item_code=allowed_item, qty=5, rate=100).name
+		mixed_order = make_sales_order(
+			item_list=[
+				{"item_code": allowed_item, "warehouse": "_Test Warehouse - _TC", "qty": 5, "rate": 100},
+				{"item_code": other_item, "warehouse": "_Test Warehouse - _TC", "qty": 3, "rate": 100},
+			]
+		).name
+		planner = create_manufacturing_user("planner-item@example.com")
+		frappe.get_doc(
+			{"doctype": "User Permission", "user": planner, "allow": "Item", "for_value": allowed_item}
+		).insert(ignore_permissions=True)
+
+		self.addCleanup(frappe.set_user, "Administrator")
+		frappe.set_user(planner)
+		rows = sales_order_query(filters={"item_code": allowed_item})
+		self.assertEqual([row[0] for row in rows], [allowed_order])
+		self.assertEqual(get_so_details(allowed_order).customer, "_Test Customer")
+		self.assertRaises(frappe.PermissionError, get_so_details, mixed_order)
+
+
+def create_manufacturing_user(email, company=None):
+	if not frappe.db.exists("User", email):
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": email,
+				"first_name": email.split("@")[0],
+				"send_welcome_email": 0,
+				"roles": [{"role": "Manufacturing User"}],
+			}
+		).insert(ignore_permissions=True)
+
+	if company and not frappe.db.exists("User Permission", {"user": email, "allow": "Company"}):
+		frappe.get_doc(
+			{"doctype": "User Permission", "user": email, "allow": "Company", "for_value": company}
+		).insert(ignore_permissions=True)
+
+	return email
+
 
 def create_production_plan(**args):
 	"""
@@ -5162,6 +5991,7 @@ def create_production_plan(**args):
 			"skip_available_sub_assembly_item": args.skip_available_sub_assembly_item or 0,
 			"sub_assembly_warehouse": args.sub_assembly_warehouse,
 			"reserve_stock": args.reserve_stock or 0,
+			"consider_process_loss": args.consider_process_loss or 0,
 			"for_warehouse": args.for_warehouse or None,
 			"raw_material_group_warehouse": args.raw_material_group_warehouse or None,
 		}
@@ -5205,6 +6035,18 @@ def create_production_plan(**args):
 			pln.submit()
 
 	return pln
+
+
+def download_raw_material_rows(plan, warehouses=None):
+	"""Rows of the Download Required Materials CSV."""
+	from kordalo.manufacturing.doctype.production_plan.production_plan import (
+		download_raw_materials,
+	)
+
+	download_raw_materials(plan.as_dict(), warehouses=warehouses)
+	# the download sets this flag for its request; clear it so later tests still validate conversion factors
+	frappe.flags.show_qty_in_stock_uom = None
+	return list(csv.reader(io.StringIO(frappe.response.result)))
 
 
 def submit_work_order_from_plan(plan, qty, source_warehouse):
