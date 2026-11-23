@@ -9,10 +9,12 @@ from frappe.query_builder.functions import Locate
 from frappe.utils import flt, get_datetime
 from pypika.terms import ExistsCriterion
 
+from kordalo.accounts.report.utils import validate_date_range
 from kordalo.stock.doctype.serial_no.serial_no import get_serial_nos
 
 
 def execute(filters=None):
+	validate_date_range(filters)
 	return get_columns(filters), get_data(filters)
 
 
